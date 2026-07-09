@@ -1,0 +1,259 @@
+"""
+Common model-development utilities for B-RAS soft sensors.
+
+The functions in this file train and evaluate candidate regression models using
+cross-validated predictions. Confidence intervals are calculated by bootstrap
+resampling of paired observed-predicted values.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Tuple
+
+import numpy as np
+import pandas as pd
+
+from sklearn.base import clone
+from sklearn.ensemble import AdaBoostRegressor, RandomForestRegressor
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import KFold
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.tree import DecisionTreeRegressor
+
+try:
+    from xgboost import XGBRegressor
+except Exception:  # pragma: no cover
+    XGBRegressor = None
+
+
+@dataclass
+class TargetResult:
+    target: str
+    n_samples: int
+    best_model_name: str
+    cv_metrics: Dict[str, Dict[str, float]]
+    y_true_cv: np.ndarray
+    y_pred_cv: np.ndarray
+    best_model: object
+
+
+def get_candidate_models(random_state: int = 42) -> Dict[str, object]:
+    models: Dict[str, object] = {
+        "LinearRegression": Pipeline([
+            ("scaler", StandardScaler()),
+            ("model", LinearRegression()),
+        ]),
+        "DecisionTree": DecisionTreeRegressor(random_state=random_state),
+        "KNN_k1": Pipeline([
+            ("scaler", StandardScaler()),
+            ("knn", KNeighborsRegressor(n_neighbors=1)),
+        ]),
+        "KNN_k3": Pipeline([
+            ("scaler", StandardScaler()),
+            ("knn", KNeighborsRegressor(n_neighbors=3)),
+        ]),
+        "RandomForest": RandomForestRegressor(
+            n_estimators=200,
+            random_state=random_state,
+            n_jobs=-1,
+        ),
+        "AdaBoost": AdaBoostRegressor(
+            n_estimators=300,
+            random_state=random_state,
+        ),
+    }
+
+    if XGBRegressor is not None:
+        models["XGBoost"] = XGBRegressor(
+            n_estimators=300,
+            max_depth=3,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            objective="reg:squarederror",
+            random_state=random_state,
+            n_jobs=-1,
+        )
+
+    return models
+
+
+def cv_predictions_for_model(
+    model: object,
+    X: np.ndarray,
+    y: np.ndarray,
+    n_splits: int = 10,
+    random_state: int = 42,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return pooled cross-validated observed and predicted values."""
+    n_samples = len(y)
+    effective_splits = min(n_splits, n_samples)
+
+    if effective_splits < 2:
+        raise ValueError("At least two samples are required for cross-validation.")
+
+    kf = KFold(n_splits=effective_splits, shuffle=True, random_state=random_state)
+
+    y_true_all = np.asarray(y, dtype=float).copy()
+    y_pred_all = np.zeros_like(y_true_all, dtype=float)
+
+    for train_idx, test_idx in kf.split(X):
+        m = clone(model)
+        m.fit(X[train_idx], y[train_idx])
+        y_pred_all[test_idx] = m.predict(X[test_idx])
+
+    return y_true_all, y_pred_all
+
+
+def metric_values(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+    return {
+        "mae": float(mean_absolute_error(y_true, y_pred)),
+        "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
+        "r2": float(r2_score(y_true, y_pred)),
+    }
+
+
+def paired_bootstrap_ci(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    n_bootstrap: int = 1000,
+    confidence_level: float = 0.95,
+    random_state: int = 42,
+) -> Dict[str, float]:
+    """Bootstrap 95 percent CIs by resampling observed-predicted pairs."""
+    rng = np.random.default_rng(random_state)
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+
+    n = len(y_true)
+    if n != len(y_pred):
+        raise ValueError("y_true and y_pred must have the same length.")
+    if n < 2:
+        raise ValueError("At least two paired observations are required.")
+
+    boot = {"mae": [], "rmse": [], "r2": []}
+    for _ in range(n_bootstrap):
+        idx = rng.integers(0, n, size=n)
+        vals = metric_values(y_true[idx], y_pred[idx])
+        for key in boot:
+            boot[key].append(vals[key])
+
+    alpha = (1.0 - confidence_level) / 2.0
+    out: Dict[str, float] = {}
+    for key, values in boot.items():
+        out[f"{key}_ci_lower"] = float(np.percentile(values, 100.0 * alpha))
+        out[f"{key}_ci_upper"] = float(np.percentile(values, 100.0 * (1.0 - alpha)))
+    return out
+
+
+def evaluate_models(
+    X: np.ndarray,
+    y: np.ndarray,
+    n_splits: int = 10,
+    random_state: int = 42,
+    n_bootstrap: int = 1000,
+) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Tuple[np.ndarray, np.ndarray]]]:
+    models = get_candidate_models(random_state=random_state)
+    metrics: Dict[str, Dict[str, float]] = {}
+    predictions: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+
+    for name, model in models.items():
+        y_true_cv, y_pred_cv = cv_predictions_for_model(
+            model, X, y, n_splits=n_splits, random_state=random_state
+        )
+        vals = metric_values(y_true_cv, y_pred_cv)
+        vals.update(paired_bootstrap_ci(
+            y_true_cv, y_pred_cv,
+            n_bootstrap=n_bootstrap,
+            random_state=random_state,
+        ))
+        metrics[name] = vals
+        predictions[name] = (y_true_cv, y_pred_cv)
+
+    return metrics, predictions
+
+
+def run_target_pipeline(
+    df: pd.DataFrame,
+    feature_cols: List[str],
+    target_col: str,
+    n_splits: int = 10,
+    random_state: int = 42,
+    n_bootstrap: int = 1000,
+    choose_by: str = "mae",
+) -> TargetResult:
+    sub_df = df[feature_cols + [target_col]].dropna()
+    if sub_df.empty:
+        raise ValueError(f"No complete rows found for target {target_col}.")
+
+    X = sub_df[feature_cols].to_numpy(dtype=float)
+    y = sub_df[target_col].to_numpy(dtype=float)
+
+    cv_metrics, cv_predictions = evaluate_models(
+        X, y,
+        n_splits=n_splits,
+        random_state=random_state,
+        n_bootstrap=n_bootstrap,
+    )
+
+    if choose_by == "mae":
+        best_model_name = min(cv_metrics, key=lambda name: cv_metrics[name]["mae"])
+    elif choose_by == "r2":
+        best_model_name = max(cv_metrics, key=lambda name: cv_metrics[name]["r2"])
+    else:
+        raise ValueError("choose_by must be 'mae' or 'r2'.")
+
+    y_true_cv, y_pred_cv = cv_predictions[best_model_name]
+
+    final_model = clone(get_candidate_models(random_state=random_state)[best_model_name])
+    final_model.fit(X, y)
+
+    return TargetResult(
+        target=target_col,
+        n_samples=len(y),
+        best_model_name=best_model_name,
+        cv_metrics=cv_metrics,
+        y_true_cv=y_true_cv,
+        y_pred_cv=y_pred_cv,
+        best_model=final_model,
+    )
+
+
+def format_target(name: str) -> str:
+    return name.replace("(", " (").replace("NO3", "NO3").replace("NO2", "NO2")
+
+
+def result_summary_rows(results: Iterable[TargetResult]) -> List[Dict[str, str]]:
+    rows = []
+    for res in results:
+        best = res.cv_metrics[res.best_model_name]
+        rows.append({
+            "Target": res.target,
+            "N": res.n_samples,
+            "Best Model": res.best_model_name,
+            "R2": f"{best['r2']:.3f}",
+            "R2 95% CI": f"[{best['r2_ci_lower']:.3f}, {best['r2_ci_upper']:.3f}]",
+            "MAE": f"{best['mae']:.3f}",
+            "MAE 95% CI": f"[{best['mae_ci_lower']:.3f}, {best['mae_ci_upper']:.3f}]",
+            "RMSE": f"{best['rmse']:.3f}",
+            "RMSE 95% CI": f"[{best['rmse_ci_lower']:.3f}, {best['rmse_ci_upper']:.3f}]",
+        })
+    return rows
+
+
+def all_model_metric_table(results: Iterable[TargetResult]) -> pd.DataFrame:
+    data: Dict[str, Dict[str, str]] = {}
+    for res in results:
+        short_target = res.target.replace("(mg/L)", "").strip()
+        for model_name, metrics in res.cv_metrics.items():
+            data.setdefault(model_name, {})
+            data[model_name][f"{short_target} MAE"] = f"{metrics['mae']:.3f}"
+            data[model_name][f"{short_target} RMSE"] = f"{metrics['rmse']:.3f}"
+            data[model_name][f"{short_target} R2"] = f"{metrics['r2']:.3f}"
+    df = pd.DataFrame.from_dict(data, orient="index")
+    df.index.name = "Model"
+    return df
