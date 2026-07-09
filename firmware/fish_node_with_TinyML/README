@@ -1,0 +1,14 @@
+# Fish-tank node with TinyML
+
+This sketch reads fish-tank sensors and runs embedded prediction of TAN, TOC, DOC, TN, and DN.
+
+## Inputs used by the embedded model
+
+The deployed fish model header expects four inputs in this order:
+
+1. DO_F(mg/L)
+2. ORP_F(mV)
+3. pH_F
+4. Ec_F(mS/cm)
+5. Temp_F(C)
+
