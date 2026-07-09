@@ -1,0 +1,14 @@
+#ifndef CONFIG_EXAMPLE_H
+#define CONFIG_EXAMPLE_H
+
+// Copy this file to config.h if you prefer to keep private values outside the .ino file.
+// Do not commit config.h to GitHub.
+
+#define PRODUCT_UID "YOUR_NOTEHUB_PRODUCT_UID"
+
+// Default timing used by the firmware.
+const int OUTBOUND_MINUTES = 30;
+const int INBOUND_MINUTES  = 240;
+const uint32_t HOST_SLEEP_SECONDS = 600;
+
+#endif
