@@ -1,0 +1,23 @@
+# Biofloc node with TinyML
+
+This sketch reads the biofloc-reactor sensors and runs embedded prediction of TAN, TOC, DOC, TN, and DN.
+
+## Inputs used by the embedded model
+
+The model header expects six inputs in this order:
+
+1. DO_B(mg/L)
+2. ORP_B(mV)
+3. EC_B(mS/cm)
+4. pH_B
+5. Temp_B(C)
+6. Turbidty_B(NTU)
+
+## Required files in this Arduino sketch folder
+
+- `biofloc_node_with_TinyML.ino`
+- `biofloc_compact_models.h`
+
+## Notes
+
+This version includes RS-485 turbidity, Blues Notecard telemetry, runtime memory reporting, inference-latency reporting, and Blues Sleepy Sensor host sleep using `card.attn`.
