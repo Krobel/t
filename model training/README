@@ -1,0 +1,26 @@
+# Model training
+
+This folder contains cleaned Python scripts for model development.
+
+## Main scripts
+
+- `run_biofloc_models.py`: trains and evaluates models for the biofloc reactor using DO, ORP, EC, pH, temperature, and turbidity.
+- `run_fish_models.py`: trains and evaluates models for the fish tank using DO, ORP, pH, and temperature.
+- `common_model_pipeline.py`: shared candidate models, cross-validation, metric calculation, and paired bootstrap confidence intervals.
+
+## Dataset path
+
+The scripts currently use the Colab path:
+
+```python
+/content/drive/MyDrive/Colab Notebooks/split tank full data.xlsx
+```
+
+Update `FILE_PATH` in each script if the dataset is stored somewhere else.
+
+## Confidence intervals
+
+The cleaned pipeline calculates 95 percent confidence intervals by bootstrap resampling of the pooled paired observed-predicted cross-validation values.
+
+## Original uploaded code
+
