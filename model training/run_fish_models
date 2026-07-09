@@ -1,0 +1,95 @@
+"""Run fish-tank model development."""
+
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+from common_model_pipeline import all_model_metric_table, result_summary_rows, run_target_pipeline
+
+FILE_PATH = "/content/drive/MyDrive/Colab Notebooks/split tank full data.xlsx"
+SHEET_NAME = "Fish tank"
+
+# Final deployed fish model uses four features.
+# EC may be measured and transmitted by the firmware, but the deployed fish model header does not use EC.
+FEATURES_FISH = [
+    "DO_F(mg/L)",
+    "ORP_F(mV)",
+    "pH_F",
+    "Ec_F(mS/cm)"
+    "Temp_F(C)",
+]
+
+TARGETS_FISH = [
+    "TAN_F(mg/L)",
+    "TOC_F(mg/L)",
+    "DOC_F(mg/L)",
+    "TN_F(mg/L)",
+    "DN_F(mg/L)",
+]
+
+OUTPUT_DIR = Path("results_fish")
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+
+def plot_results(results):
+    n = len(results)
+    ncols = 2
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(10, 4 * nrows), squeeze=False)
+    axes = axes.ravel()
+
+    handles, labels = [], []
+    for i, (ax, res) in enumerate(zip(axes, results)):
+        idx = np.arange(len(res.y_true_cv))
+        line1, = ax.plot(idx, res.y_true_cv, label="Observed", linewidth=1)
+        line2, = ax.plot(idx, res.y_pred_cv, label="Predicted", linewidth=1)
+        if i == 0:
+            handles, labels = [line1, line2], ["Observed", "Predicted"]
+
+        best = res.cv_metrics[res.best_model_name]
+        ax.set_xlabel("Sample index", fontsize=14)
+        ax.set_ylabel(res.target, fontsize=14)
+        box_text = (
+            f"Best Model: {res.best_model_name}\n"
+            f"MAE: {best['mae']:.3f}\n"
+            f"95% CI: [{best['mae_ci_lower']:.3f}, {best['mae_ci_upper']:.3f}]\n"
+            f"RMSE: {best['rmse']:.3f}\n"
+            f"R2: {best['r2']:.3f}"
+        )
+        ax.text(0.05, 0.85, box_text, transform=ax.transAxes,
+                verticalalignment="top", horizontalalignment="left",
+                bbox=dict(boxstyle="round,pad=0.5", fc="wheat", alpha=0.5),
+                fontsize=12)
+        ax.text(0.02, 0.98, f"({chr(ord('a') + i)})", transform=ax.transAxes,
+                fontsize=16, fontweight="bold", verticalalignment="top")
+
+    for j in range(n, len(axes)):
+        fig.delaxes(axes[j])
+
+    fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 1.0),
+               ncol=2, fontsize=12)
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.savefig(OUTPUT_DIR / "fish_tank_results.png", dpi=600, bbox_inches="tight")
+    plt.show()
+
+
+def main():
+    df = pd.read_excel(FILE_PATH, sheet_name=SHEET_NAME)
+    results = [
+        run_target_pipeline(df, FEATURES_FISH, target, n_splits=10, n_bootstrap=1000)
+        for target in TARGETS_FISH
+    ]
+
+    pd.DataFrame(result_summary_rows(results)).to_csv(
+        OUTPUT_DIR / "fish_best_model_summary.csv", index=False
+    )
+    all_model_metric_table(results).to_csv(
+        OUTPUT_DIR / "fish_all_model_metrics.csv"
+    )
+    plot_results(results)
+
+
+if __name__ == "__main__":
+    main()
