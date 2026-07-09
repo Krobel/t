@@ -1,0 +1,713 @@
+// WATER QUALITY MONITORING SYSTEM
+// ESP32-S3 + Notecard I2C + Atlas I2C
+// Prediction without turbidity
+// Model inputs: DO, ORP, pH, Temp
+// EC is read and transmitted, but it is not used by the deployed fish model
+// Outputs: TAN, TOC, DOC, TN, DN
+// Includes runtime memory reporting and inference latency measurement
+// Includes Blues Sleepy Sensor host sleep using card.attn
+// No ESP32 esp_sleep.h fallback is used
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <Notecard.h>
+#include <Ezo_i2c.h>
+#include <Ezo_i2c_util.h>
+
+// Generated compact C model header from Colab.
+// This header must match the deployed fish model input order: DO, ORP, pH, Temp.
+#include "fish_compact_models.h"
+
+// ----------------- Board pin configuration -----------------
+
+#define I2C_SDA_PIN   3
+#define I2C_SCL_PIN   4
+
+// ----------------- Notecard / Atlas setup -----------------
+
+Notecard notecard;
+
+#ifndef PRODUCT_UID
+#define PRODUCT_UID "YOUR_NOTEHUB_PRODUCT_UID"
+#endif
+
+// Notecard sync tuning
+const int OUTBOUND_MINUTES = 30;
+const int INBOUND_MINUTES  = 240;
+
+// Blues Sleepy Sensor host sleep interval
+const uint32_t HOST_SLEEP_SECONDS = 600;  // 10 minutes
+
+// Used for CPU duty calculation
+const float CYCLE_INTERVAL_MS = HOST_SLEEP_SECONDS * 1000.0f;
+
+// ----------------- Atlas sensors -----------------
+
+Ezo_board ORP(0x62, "ORP");
+Ezo_board DO(0x61, "DO");
+Ezo_board pH(0x63, "pH");
+Ezo_board Ec(0x64, "Ec");
+Ezo_board atlasTemp(0x66, "Temp");
+
+// ----------------- Sensor globals -----------------
+
+float Ec_float   = NAN;  // Atlas EC output, usually uS/cm
+float Temp_float = NAN;
+float pH_float   = NAN;
+float DO_float   = NAN;
+float ORP_float  = NAN;
+
+String Time;
+
+// ----------------- Prediction globals -----------------
+
+float tan_pred = NAN;
+float toc_pred = NAN;
+float doc_pred = NAN;
+float tn_pred  = NAN;
+float dn_pred  = NAN;
+
+// ----------------- Runtime memory globals -----------------
+
+uint32_t free_heap_bytes = 0;
+uint32_t heap_size_bytes = 0;
+uint32_t min_free_heap_bytes = 0;
+
+bool psram_found = false;
+uint32_t psram_total_bytes = 0;
+uint32_t psram_free_bytes  = 0;
+uint32_t psram_used_bytes  = 0;
+
+// ----------------- Inference timing globals -----------------
+
+float latest_inference_ms = NAN;
+float mean_inference_ms   = NAN;
+float max_inference_ms    = 0.0f;
+float sum_inference_ms    = 0.0f;
+unsigned long inference_count = 0;
+
+float estimated_cpu_duty_percent = NAN;
+
+// ---------------------------------------------------------------------
+// Forward declarations
+// ---------------------------------------------------------------------
+
+static inline bool validNumber(double v);
+
+void readTemperature();
+void readSensors();
+
+bool runInferenceWithoutTurbidity(
+  float DO_value,
+  float ORP_value,
+  float ec_mS,
+  float pH_value,
+  float Temp_value
+);
+
+void updateMemoryMetrics();
+void printMemoryReport();
+void printInferenceReport();
+void printFullResourceReport();
+
+void sendToNotecard(
+  float ec_mS,
+  float tan_value,
+  float toc_value,
+  float doc_value,
+  float tn_value,
+  float dn_value
+);
+
+unsigned long getNotecardTime();
+String convertEpochToTime(unsigned long epochTime);
+
+void sleepHostWithNotecard(uint32_t seconds);
+
+// ---------------------------------------------------------------------
+// Utility
+// ---------------------------------------------------------------------
+
+static inline bool validNumber(double v) {
+  return !isnan(v) && isfinite(v);
+}
+
+// ---------------------------------------------------------------------
+// Setup
+// ---------------------------------------------------------------------
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+
+  Serial.println();
+  Serial.println("ESP32-S3 prediction node starting...");
+  Serial.println("Prediction mode: without turbidity");
+  Serial.println("Inputs: DO, ORP, EC, pH, Temp");
+  Serial.println("Runtime memory and inference reporting enabled.");
+  Serial.println("Blues Sleepy Sensor mode enabled.");
+
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+
+  notecard.begin();
+  notecard.setDebugOutputStream(Serial);
+
+  J *req = notecard.newRequest("hub.set");
+
+  if (req) {
+    JAddStringToObject(req, "product", PRODUCT_UID);
+    JAddStringToObject(req, "mode", "periodic");
+    JAddNumberToObject(req, "outbound", OUTBOUND_MINUTES);
+    JAddNumberToObject(req, "inbound",  INBOUND_MINUTES);
+    JAddBoolToObject(req, "align", true);
+
+    if (!notecard.sendRequest(req)) {
+      Serial.println("hub.set request failed.");
+    } else {
+      Serial.println("hub.set configured.");
+    }
+  } else {
+    Serial.println("hub.set request allocation failed.");
+  }
+
+  updateMemoryMetrics();
+  printMemoryReport();
+}
+
+// ---------------------------------------------------------------------
+// Main loop
+// ---------------------------------------------------------------------
+
+void loop() {
+  unsigned long epochTime = getNotecardTime();
+  Time = convertEpochToTime(epochTime);
+
+  // 1. Read Atlas sensors
+  readTemperature();
+  readSensors();
+
+  // EC from Atlas is commonly uS/cm.
+  // Model was trained using EC in mS/cm.
+  float ec_mS = validNumber(Ec_float) ? (Ec_float / 1000.0f) : NAN;
+
+  Serial.println();
+  Serial.println("----- Sensor reading -----");
+  Serial.print("Timestamp: ");
+  Serial.println(Time);
+
+  Serial.print("EC (uS/cm): ");
+  Serial.print(Ec_float, 1);
+
+  Serial.print(" | EC (mS/cm): ");
+  Serial.print(ec_mS, 3);
+
+  Serial.print(" | Temp (C): ");
+  Serial.print(Temp_float, 2);
+
+  Serial.print(" | DO (mg/L): ");
+  Serial.print(DO_float, 2);
+
+  Serial.print(" | pH: ");
+  Serial.print(pH_float, 2);
+
+  Serial.print(" | ORP (mV): ");
+  Serial.println(ORP_float, 1);
+
+  // 2. Reset predictions
+  tan_pred = NAN;
+  toc_pred = NAN;
+  doc_pred = NAN;
+  tn_pred  = NAN;
+  dn_pred  = NAN;
+
+  // 3. Run no-turbidity prediction
+  bool prediction_ok = runInferenceWithoutTurbidity(
+    DO_float,
+    ORP_float,
+    pH_float,
+    Temp_float
+  );
+
+  if (!prediction_ok) {
+    Serial.println("Prediction skipped because one or more model inputs are invalid.");
+  }
+
+  Serial.print("Predictions without turbidity -> TAN: ");
+  Serial.print(tan_pred, 3);
+
+  Serial.print(" | TOC: ");
+  Serial.print(toc_pred, 3);
+
+  Serial.print(" | DOC: ");
+  Serial.print(doc_pred, 3);
+
+  Serial.print(" | TN: ");
+  Serial.print(tn_pred, 3);
+
+  Serial.print(" | DN: ");
+  Serial.println(dn_pred, 3);
+
+  // 4. Update and print resource reports
+  updateMemoryMetrics();
+  printFullResourceReport();
+
+  // 5. Send data to Notecard
+  sendToNotecard(
+    ec_mS,
+    tan_pred,
+    toc_pred,
+    doc_pred,
+    tn_pred,
+    dn_pred
+  );
+
+  // 6. Ask the Notecard to put the host to sleep
+  sleepHostWithNotecard(HOST_SLEEP_SECONDS);
+}
+
+// ---------------------------------------------------------------------
+// Blues Sleepy Sensor host sleep
+// ---------------------------------------------------------------------
+
+void sleepHostWithNotecard(uint32_t seconds) {
+  Serial.println();
+  Serial.print("Requesting Notecard host sleep for ");
+  Serial.print(seconds);
+  Serial.println(" seconds...");
+  Serial.flush();
+
+  J *req = notecard.newRequest("card.attn");
+
+  if (!req) {
+    Serial.println("card.attn request allocation failed.");
+    return;
+  }
+
+  JAddStringToObject(req, "mode", "sleep");
+  JAddNumberToObject(req, "seconds", seconds);
+
+  if (!notecard.sendRequest(req)) {
+    Serial.println("Failed to send card.attn sleep request.");
+    return;
+  }
+
+  delay(250);
+
+  Serial.println("card.attn sleep request sent.");
+  Serial.println("If Notecard ATTN is wired to ESP32-S3 EN, the host should shut down now.");
+  Serial.println("If the board stays awake, check ATTN-to-EN wiring.");
+  Serial.flush();
+
+  // With correct wiring, the ESP32 should be disabled before this matters.
+  // If the ESP32 remains awake, this prevents repeated readings.
+  while (true) {
+    delay(1000);
+  }
+}
+
+// ---------------------------------------------------------------------
+// Prediction without turbidity
+// ---------------------------------------------------------------------
+
+bool runInferenceWithoutTurbidity(
+  float DO_value,
+  float ORP_value,
+  float pH_value,
+  float Temp_value
+) {
+  if (!validNumber(DO_value) ||
+      !validNumber(ORP_value) ||
+      !validNumber(pH_value) ||
+      !validNumber(Temp_value)) {
+    latest_inference_ms = NAN;
+    estimated_cpu_duty_percent = NAN;
+    return false;
+  }
+
+  // Feature order must match fish_compact_models.h:
+  // input_raw[0] = DO_F(mg/L)
+  // input_raw[1] = ORP_F(mV)
+  // input_raw[2] = pH_F
+  // input_raw[3] = Temp_F(C)
+
+  float input_raw[FISH_N_FEATURES];
+
+  input_raw[0] = DO_value;
+  input_raw[1] = ORP_value;
+  input_raw[2] = pH_value;
+  input_raw[3] = Temp_value;
+
+  unsigned long t0 = micros();
+
+  tan_pred = predict_tan_f_mg_l(input_raw);
+  toc_pred = predict_toc_f_mg_l(input_raw);
+  doc_pred = predict_doc_f_mg_l(input_raw);
+  tn_pred  = predict_tn_f_mg_l(input_raw);
+  dn_pred  = predict_dn_f_mg_l(input_raw);
+
+  unsigned long t1 = micros();
+
+  latest_inference_ms = (t1 - t0) / 1000.0f;
+
+  sum_inference_ms += latest_inference_ms;
+  inference_count++;
+
+  mean_inference_ms = sum_inference_ms / inference_count;
+
+  if (latest_inference_ms > max_inference_ms) {
+    max_inference_ms = latest_inference_ms;
+  }
+
+  estimated_cpu_duty_percent = (mean_inference_ms / CYCLE_INTERVAL_MS) * 100.0f;
+
+  return true;
+}
+
+// ---------------------------------------------------------------------
+// Runtime memory metrics
+// ---------------------------------------------------------------------
+
+void updateMemoryMetrics() {
+  free_heap_bytes = ESP.getFreeHeap();
+  heap_size_bytes = ESP.getHeapSize();
+  min_free_heap_bytes = ESP.getMinFreeHeap();
+
+  psram_found = psramFound();
+
+  if (psram_found) {
+    psram_total_bytes = ESP.getPsramSize();
+    psram_free_bytes  = ESP.getFreePsram();
+    psram_used_bytes  = psram_total_bytes - psram_free_bytes;
+  } else {
+    psram_total_bytes = 0;
+    psram_free_bytes  = 0;
+    psram_used_bytes  = 0;
+  }
+}
+
+void printMemoryReport() {
+  Serial.println();
+  Serial.println("===== Memory report =====");
+
+  Serial.print("Free heap bytes: ");
+  Serial.println(free_heap_bytes);
+
+  Serial.print("Free heap kB: ");
+  Serial.println(free_heap_bytes / 1024.0f, 2);
+
+  Serial.print("Heap size bytes: ");
+  Serial.println(heap_size_bytes);
+
+  Serial.print("Heap size kB: ");
+  Serial.println(heap_size_bytes / 1024.0f, 2);
+
+  Serial.print("Minimum free heap bytes: ");
+  Serial.println(min_free_heap_bytes);
+
+  Serial.print("Minimum free heap kB: ");
+  Serial.println(min_free_heap_bytes / 1024.0f, 2);
+
+  Serial.print("PSRAM found: ");
+  Serial.println(psram_found ? "Yes" : "No");
+
+  Serial.print("PSRAM used bytes: ");
+  Serial.println(psram_used_bytes);
+
+  Serial.print("PSRAM used kB: ");
+  Serial.println(psram_used_bytes / 1024.0f, 2);
+
+  Serial.println("=========================");
+}
+
+void printInferenceReport() {
+  Serial.println();
+  Serial.println("===== Inference report =====");
+
+  Serial.print("Latest inference latency ms: ");
+  if (validNumber(latest_inference_ms)) {
+    Serial.println(latest_inference_ms, 3);
+  } else {
+    Serial.println("N.A.");
+  }
+
+  Serial.print("Mean inference latency ms: ");
+  if (validNumber(mean_inference_ms)) {
+    Serial.println(mean_inference_ms, 3);
+  } else {
+    Serial.println("N.A.");
+  }
+
+  Serial.print("Maximum inference latency ms: ");
+  Serial.println(max_inference_ms, 3);
+
+  Serial.print("Estimated inference CPU duty %: ");
+  if (validNumber(estimated_cpu_duty_percent)) {
+    Serial.println(estimated_cpu_duty_percent, 8);
+  } else {
+    Serial.println("N.A.");
+  }
+
+  Serial.print("Inference count: ");
+  Serial.println(inference_count);
+
+  Serial.println("============================");
+}
+
+void printFullResourceReport() {
+  printMemoryReport();
+  printInferenceReport();
+}
+
+// ---------------------------------------------------------------------
+// Sensor reading functions
+// ---------------------------------------------------------------------
+
+void readTemperature() {
+  atlasTemp.send_read_cmd();
+  delay(600);
+
+  if (atlasTemp.receive_read_cmd() == Ezo_board::SUCCESS) {
+    Temp_float = atlasTemp.get_last_received_reading();
+    Serial.print("Temperature (C): ");
+    Serial.println(Temp_float, 2);
+  } else {
+    Serial.println("Failed to read temperature");
+    Temp_float = NAN;
+  }
+}
+
+void readSensors() {
+  float temp_comp = (Temp_float > 0.0f && Temp_float < 100.0f) ? Temp_float : 25.0f;
+
+  Serial.print("Compensation temperature: ");
+  Serial.println(temp_comp, 2);
+
+  Ec.send_read_with_temp_comp(temp_comp);
+  delay(900);
+
+  if (Ec.receive_read_cmd() == Ezo_board::SUCCESS) {
+    Ec_float = Ec.get_last_received_reading();
+  } else {
+    Serial.println("Failed EC");
+    Ec_float = NAN;
+  }
+
+  Serial.print("EC (uS/cm): ");
+  Serial.println(Ec_float, 1);
+
+  DO.send_read_with_temp_comp(temp_comp);
+  delay(900);
+
+  if (DO.receive_read_cmd() == Ezo_board::SUCCESS) {
+    DO_float = DO.get_last_received_reading();
+  } else {
+    Serial.println("Failed DO");
+    DO_float = NAN;
+  }
+
+  pH.send_read_with_temp_comp(temp_comp);
+  delay(900);
+
+  if (pH.receive_read_cmd() == Ezo_board::SUCCESS) {
+    pH_float = pH.get_last_received_reading();
+  } else {
+    Serial.println("Failed pH");
+    pH_float = NAN;
+  }
+
+  ORP.send_read_cmd();
+  delay(900);
+
+  if (ORP.receive_read_cmd() == Ezo_board::SUCCESS) {
+    ORP_float = ORP.get_last_received_reading();
+  } else {
+    Serial.println("Failed ORP");
+    ORP_float = NAN;
+  }
+}
+
+// ---------------------------------------------------------------------
+// Notecard integration
+// ---------------------------------------------------------------------
+
+void sendToNotecard(
+  float ec_mS,
+  float tan_value,
+  float toc_value,
+  float doc_value,
+  float tn_value,
+  float dn_value
+) {
+  J *req = notecard.newRequest("note.add");
+
+  if (!req) {
+    Serial.println("note.add alloc failed");
+    return;
+  }
+
+  JAddStringToObject(req, "file", "sensors.qo");
+
+  J *body = JCreateObject();
+
+  if (!body) {
+    Serial.println("body alloc failed");
+    notecard.deleteResponse(req);
+    return;
+  }
+
+  JAddStringToObject(body, "timestamp", Time.c_str());
+
+  // Raw sensors
+  if (validNumber(Ec_float)) {
+    JAddNumberToObject(body, "ec_uScm", Ec_float);
+  }
+
+  if (validNumber(ec_mS)) {
+    JAddNumberToObject(body, "ec_mScm", ec_mS);
+  }
+
+  if (validNumber(Temp_float)) {
+    JAddNumberToObject(body, "temp", Temp_float);
+  }
+
+  if (validNumber(DO_float)) {
+    JAddNumberToObject(body, "DO", DO_float);
+  }
+
+  if (validNumber(pH_float)) {
+    JAddNumberToObject(body, "pH", pH_float);
+  }
+
+  if (validNumber(ORP_float)) {
+    JAddNumberToObject(body, "ORP", ORP_float);
+  }
+
+  // On-device no-turbidity predictions
+  if (validNumber(tan_value)) {
+    JAddNumberToObject(body, "TAN_pred", tan_value);
+  }
+
+  if (validNumber(toc_value)) {
+    JAddNumberToObject(body, "TOC_pred", toc_value);
+  }
+
+  if (validNumber(doc_value)) {
+    JAddNumberToObject(body, "DOC_pred", doc_value);
+  }
+
+  if (validNumber(tn_value)) {
+    JAddNumberToObject(body, "TN_pred", tn_value);
+  }
+
+  if (validNumber(dn_value)) {
+    JAddNumberToObject(body, "DN_pred", dn_value);
+  }
+
+  // Runtime memory metrics
+  JAddNumberToObject(body, "free_heap_kB", free_heap_bytes / 1024.0f);
+  JAddNumberToObject(body, "heap_size_kB", heap_size_bytes / 1024.0f);
+  JAddNumberToObject(body, "min_free_heap_kB", min_free_heap_bytes / 1024.0f);
+  JAddNumberToObject(body, "psram_used_kB", psram_used_bytes / 1024.0f);
+
+  // Inference metrics
+  if (validNumber(latest_inference_ms)) {
+    JAddNumberToObject(body, "inference_latest_ms", latest_inference_ms);
+  }
+
+  if (validNumber(mean_inference_ms)) {
+    JAddNumberToObject(body, "inference_mean_ms", mean_inference_ms);
+  }
+
+  JAddNumberToObject(body, "inference_max_ms", max_inference_ms);
+
+  if (validNumber(estimated_cpu_duty_percent)) {
+    JAddNumberToObject(body, "inference_cpu_duty_percent", estimated_cpu_duty_percent);
+  }
+
+  JAddNumberToObject(body, "inference_count", inference_count);
+
+  JAddItemToObject(req, "body", body);
+
+  if (!notecard.sendRequest(req)) {
+    Serial.println("Failed to queue note on Notecard.");
+  } else {
+    Serial.println("Note queued on Notecard.");
+  }
+}
+
+// ---------------------------------------------------------------------
+// Time via Notecard
+// ---------------------------------------------------------------------
+
+unsigned long getNotecardTime() {
+  J *req = notecard.newRequest("card.time");
+  J *rsp = (req) ? notecard.requestAndResponse(req) : NULL;
+
+  if (!rsp) {
+    Serial.println("Failed to get time");
+    return 0;
+  }
+
+  unsigned long epochTime = JGetNumber(rsp, "time");
+  notecard.deleteResponse(rsp);
+
+  return epochTime;
+}
+
+String convertEpochToTime(unsigned long epochTime) {
+  if (epochTime == 0) {
+    return "Invalid Time";
+  }
+
+  // Local offset. Adjust if needed.
+  epochTime += 2UL * 3600UL;
+
+  int s = epochTime % 60;
+  int m = (epochTime / 60) % 60;
+  int h = (epochTime / 3600) % 24;
+  int days = epochTime / 86400;
+
+  int year = 1970;
+
+  auto leap = [](int y) {
+    return ((y % 4 == 0 && y % 100 != 0) || (y % 400 == 0));
+  };
+
+  while (days >= (leap(year) ? 366 : 365)) {
+    days -= (leap(year) ? 366 : 365);
+    year++;
+  }
+
+  int md[] = {
+    31, 28, 31, 30, 31, 30,
+    31, 31, 30, 31, 30, 31
+  };
+
+  if (leap(year)) {
+    md[1] = 29;
+  }
+
+  int mon = 0;
+
+  while (days >= md[mon]) {
+    days -= md[mon];
+    mon++;
+  }
+
+  int day = days + 1;
+
+  char buf[20];
+
+  sprintf(
+    buf,
+    "%04d-%02d-%02d %02d:%02d:%02d",
+    year,
+    mon + 1,
+    day,
+    h,
+    m,
+    s
+  );
+
+  return String(buf);
+}
