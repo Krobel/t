@@ -1,0 +1,14 @@
+# Fish-tank node without TinyML
+
+This sketch is the fish-tank sensor-only baseline.
+
+It reads Atlas I2C sensors, sends the measurements to Blues Notehub, and reports runtime memory. It does not include turbidity or embedded prediction.
+
+## Included variables
+
+- DO
+- ORP
+- EC
+- pH
+- Temperature
+- Runtime heap and PSRAM metrics
