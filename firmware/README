@@ -1,0 +1,16 @@
+# Firmware
+
+This folder contains the ESP32-S3 firmware variants used for sensor-only and TinyML-enabled deployment.
+
+## Folder summary
+
+| Folder | Node | TinyML | Turbidity | Notes |
+|---|---|---:|---:|---|
+| `biofloc_node_with_TinyML` | Biofloc reactor | Yes | Yes | Reads Atlas sensors and RS-485 turbidity, then predicts TAN, TOC, DOC, TN, and DN. |
+| `biofloc_node_without_TinyML` | Biofloc reactor | No | Yes | Sensor-only baseline with turbidity and memory reporting. |
+| `fish_node_with_TinyML` | Fish tank | Yes | No | Reads Atlas sensors and predicts TAN, TOC, DOC, TN, and DN. EC is transmitted but not used by the deployed fish model. |
+| `fish_node_without_TinyML` | Fish tank | No | No | Sensor-only baseline without turbidity and without prediction. |
+
+## Public repository safety
+
+The real Notehub ProductUID was removed and replaced with `YOUR_NOTEHUB_PRODUCT_UID`.
