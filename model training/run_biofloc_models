@@ -1,17 +1,26 @@
-"""Run biofloc tank model development."""
-
-from pathlib import Path
-
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+from math import ceil
 
-from common_model_pipeline import all_model_metric_table, result_summary_rows, run_target_pipeline
+from sklearn.linear_model import LinearRegression
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.ensemble import RandomForestRegressor, AdaBoostRegressor
+from sklearn.model_selection import KFold, LeaveOneOut, GridSearchCV # Import GridSearchCV
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.base import clone
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from xgboost import XGBRegressor
 
-FILE_PATH = "/content/drive/MyDrive/Colab Notebooks/split tank full data.xlsx"
-SHEET_NAME = "Biofloc tank"
+from google.colab import drive
+drive.mount('/content/drive')
 
-FEATURES_BIO = [
+file_path = "/content/drive/MyDrive/Colab Notebooks/split tank full data.xlsx"
+bio_df = pd.read_excel(file_path, sheet_name="Biofloc tank")
+
+features_bio = [
     "DO_B(mg/L)",
     "ORP_B(mV)",
     "EC_B(mS/cm)",
@@ -20,7 +29,7 @@ FEATURES_BIO = [
     "Turbidty_B(NTU)",
 ]
 
-TARGETS_BIO = [
+targets_bio = [
     "TAN_B(mg/L)",
     "TOC_B(mg/L)",
     "DOC_B(mg/L)",
@@ -28,67 +37,381 @@ TARGETS_BIO = [
     "DN_B(mg/L)",
 ]
 
-OUTPUT_DIR = Path("results_biofloc")
-OUTPUT_DIR.mkdir(exist_ok=True)
+def get_candidate_models_and_params():
+    models = {
+        "LinearRegression": Pipeline(
+            [ ("scaler", StandardScaler()), ("model", LinearRegression()) ]
+        ),
+        "DecisionTree": DecisionTreeRegressor(random_state=42),
+        "KNN": Pipeline(
+            [ ("scaler", StandardScaler()), ("knn", KNeighborsRegressor()) ]
+        ),
+        "RandomForest": RandomForestRegressor(
+            random_state=42,
+            n_jobs=-1
+        ),
+        "AdaBoost": AdaBoostRegressor(
+            random_state=42
+        ),
+        "XGBoost": XGBRegressor(
+            objective="reg:squarederror",
+            random_state=42,
+            n_jobs=-1
+        ),
+    }
 
+    param_grids = {
+        "LinearRegression": {},
+        "DecisionTree": {
+            "max_depth": [2, 3, 4, 5, None],
+            "min_samples_leaf": [1, 3, 5],
+        },
+        "KNN": {
+            "knn__n_neighbors": [1, 3], # n_neighbors = 5 has been removed as per request
+            "knn__weights": ["uniform", "distance"],
+        },
+        "RandomForest": {
+            "n_estimators": [50, 100, 200],
+            "max_depth": [3, 5, 7, None],
+            "min_samples_leaf": [1, 3, 5],
+        },
+        "AdaBoost": {
+            "n_estimators": [50, 100, 200],
+            "learning_rate": [0.01, 0.05, 0.1, 0.5, 1.0],
+        },
+        "XGBoost": {
+            "n_estimators": [50, 100, 200],
+            "max_depth": [2, 3, 4],
+            "learning_rate": [0.01, 0.05, 0.1],
+            "subsample": [0.7, 1.0],
+            "colsample_bytree": [0.7, 1.0], # Add colsample_bytree for more comprehensive tuning
+        },
+    }
+    return models, param_grids
 
-def plot_results(results):
-    n = len(results)
-    ncols = 2
-    nrows = int(np.ceil(n / ncols))
-    fig, axes = plt.subplots(nrows, ncols, figsize=(10, 4 * nrows), squeeze=False)
-    axes = axes.ravel()
+def cv_predictions_for_model(model, X, y, n_splits=10, random_state=42):
+    """
+    K-fold cross-validation for a single model.
 
-    handles, labels = [], []
-    for i, (ax, res) in enumerate(zip(axes, results)):
-        idx = np.arange(len(res.y_true_cv))
-        line1, = ax.plot(idx, res.y_true_cv, label="Observed", linewidth=1)
-        line2, = ax.plot(idx, res.y_pred_cv, label="Predicted", linewidth=1)
-        if i == 0:
-            handles, labels = [line1, line2], ["Observed", "Predicted"]
+    Returns
+    -------
+    mae, rmse, r2 : floats
+    y_true_all : np.ndarray, shape (n_samples,)
+    y_pred_all : np.ndarray, shape (n_samples,)
+    """
+    n_samples = len(y)
+    effective_splits = min(n_splits, n_samples)
 
-        best = res.cv_metrics[res.best_model_name]
-        ax.set_xlabel("Sample index", fontsize=14)
-        ax.set_ylabel(res.target, fontsize=14)
-        box_text = (
-            f"Best Model: {res.best_model_name}\n"
-            f"MAE: {best['mae']:.3f}\n"
-            f"95% CI: [{best['mae_ci_lower']:.3f}, {best['mae_ci_upper']:.3f}]\n"
-            f"RMSE: {best['rmse']:.3f}\n"
-            f"R2: {best['r2']:.3f}"
+    if effective_splits < 2:
+        raise ValueError("At least 2 samples are required for cross-validation.")
+
+    kf = KFold(n_splits=effective_splits, shuffle=True, random_state=random_state)
+
+    y_true_all = np.array(y, copy=True)
+    y_pred_all = np.zeros_like(y_true_all, dtype=float)
+
+    for train_idx, test_idx in kf.split(X):
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_train = y[train_idx]
+
+        m = clone(model)
+        m.fit(X_train, y_train)
+        y_pred = m.predict(X_test)
+
+        y_pred_all[test_idx] = y_pred
+
+    mae = mean_absolute_error(y_true_all, y_pred_all)
+    mse = mean_squared_error(y_true_all, y_pred_all)
+    rmse = np.sqrt(mse)
+    r2 = r2_score(y_true_all, y_pred_all)
+
+    return mae, rmse, r2, y_true_all, y_pred_all
+
+def cv_metrics_for_models(models, X, y, n_splits=10, random_state=42):
+    results = {}
+    for name, model in models.items():
+        mae, rmse, r2, _, _ = cv_predictions_for_model(
+            model, X, y, n_splits=n_splits, random_state=random_state
         )
-        ax.text(0.05, 0.85, box_text, transform=ax.transAxes,
-                verticalalignment="top", horizontalalignment="left",
-                bbox=dict(boxstyle="round,pad=0.5", fc="wheat", alpha=0.5),
-                fontsize=12)
-        ax.text(0.02, 0.98, f"({chr(ord('a') + i)})", transform=ax.transAxes,
-                fontsize=16, fontweight="bold", verticalalignment="top")
+        results[name] = {"mae": mae, "rmse": rmse, "r2": r2}
+    return results
 
-    for j in range(n, len(axes)):
-        fig.delaxes(axes[j])
+def loo_evaluation(model, X, y):
+    if len(y) < 2:
+        raise ValueError("At least 2 samples are required for leave-one-out evaluation.")
 
-    fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 1.0),
-               ncol=2, fontsize=12)
-    fig.tight_layout(rect=[0, 0, 1, 0.95])
-    fig.savefig(OUTPUT_DIR / "biofloc_tank_results.png", dpi=600, bbox_inches="tight")
-    plt.show()
+    loo = LeaveOneOut()
+    y_true_all = []
+    y_pred_all = []
+
+    for train_idx, test_idx in loo.split(X):
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_train, y_test = y[train_idx], y[test_idx]
+
+        m = clone(model)
+        m.fit(X_train, y_train)
+        y_pred = m.predict(X_test)
+
+        y_true_all.append(y_test[0])
+        y_pred_all.append(float(y_pred[0]))
+
+    y_true_all = np.array(y_true_all)
+    y_pred_all = np.array(y_pred_all)
+
+    mae = mean_absolute_error(y_true_all, y_pred_all)
+    mse = mean_squared_error(y_true_all, y_pred_all)
+    rmse = np.sqrt(mse)
+    r2 = r2_score(y_true_all, y_pred_all)
+
+    return mae, rmse, r2, y_true_all, y_pred_all
+
+def _format_target_name_for_print(name):
+    if "(" in name and ")" in name:
+        name = name.replace("(", " (")
+
+    name = name.replace("NO3_B", "NO₃_B")
+    name = name.replace("NO2_B", "NO₂_B")
+
+    return name
+
+def run_pipeline_target(df, feature_cols, target_col, n_splits=10, model_overrides=None):
+    """
+    1. K-fold CV across all models with hyperparameter tuning; choose best by highest R².
+    2. LOO evaluation for the best model.
+    3. Return metrics and predictions for both CV and LOO.
+    """
+    sub_df = df[feature_cols + [target_col]].dropna()
+
+    if sub_df.empty:
+        raise ValueError(f"No valid rows found for target: {target_col}")
+
+    X = sub_df[feature_cols].values
+    y = sub_df[target_col].values
+
+    if len(y) < 2:
+        raise ValueError(f"Not enough samples for target: {target_col}")
+
+    base_models, param_grids = get_candidate_models_and_params()
+    tuned_models = {}
+    cv_metrics = {}
+    model_best_params = {} # New: Store best params for each model after tuning
+
+    formatted_target_col = _format_target_name_for_print(target_col)
+
+    print(f"\n--- Running Hyperparameter Tuning for {formatted_target_col} ---")
+    for name, model in base_models.items():
+        print(f"  Tuning {name}...")
+        param_grid = param_grids.get(name, {})
+
+        if param_grid:
+            # Use GridSearchCV for hyperparameter tuning
+            grid_search = GridSearchCV(
+                estimator=model,
+                param_grid=param_grid,
+                scoring='neg_mean_absolute_error', # Optimize for MAE
+                cv=n_splits,
+                n_jobs=-1,
+                verbose=0
+            )
+            grid_search.fit(X, y)
+            tuned_models[name] = grid_search.best_estimator_
+            model_best_params[name] = grid_search.best_params_ # Store best params for this model
+            # Evaluate the best estimator from GridSearchCV using cv_predictions_for_model for consistent metrics calculation
+            mae, rmse, r2, _, _ = cv_predictions_for_model(
+                grid_search.best_estimator_, X, y, n_splits=n_splits, random_state=42
+            )
+            cv_metrics[name] = {"mae": mae, "rmse": rmse, "r2": r2}
+            print(f"    Best params for {name}: {grid_search.best_params_}")
+            print(f"    CV MAE for tuned {name}: {-grid_search.best_score_:.3f}") # best_score_ is negative MAE
+        else:
+            # No tuning, use base model directly
+            tuned_models[name] = model
+            model_best_params[name] = {} # No params for non-tuned models
+            mae, rmse, r2, _, _ = cv_predictions_for_model(
+                model, X, y, n_splits=n_splits, random_state=42
+            )
+            cv_metrics[name] = {"mae": mae, "rmse": rmse, "r2": r2}
+            print(f"    No tuning for {name}.")
 
 
-def main():
-    df = pd.read_excel(FILE_PATH, sheet_name=SHEET_NAME)
-    results = [
-        run_target_pipeline(df, FEATURES_BIO, target, n_splits=10, n_bootstrap=1000)
-        for target in TARGETS_BIO
-    ]
+    print(f"\n10-fold CV mean metrics per model for {formatted_target_col} (after tuning):")
+    print("  Model           |  MAE   |  RMSE  |   R²")
+    for name, m in sorted(cv_metrics.items(), key=lambda kv: kv[1]["mae"]):
+        print(f"  {name:15s} | {m['mae']:6.3f} | {m['rmse']:6.3f} | {m['r2']:6.3f}")
 
-    pd.DataFrame(result_summary_rows(results)).to_csv(
-        OUTPUT_DIR / "biofloc_best_model_summary.csv", index=False
+    best_name = min(cv_metrics, key=lambda nm: cv_metrics[nm]["mae"])
+
+    # Apply override if specified for this target
+    if model_overrides and target_col in model_overrides:
+        preferred_model_name = model_overrides[target_col]
+        if preferred_model_name in tuned_models:
+            best_name = preferred_model_name
+            print(f"    Overriding best model for {formatted_target_col} to: {best_name} (as per request)")
+        else:
+            print(f"    Warning: Preferred model '{preferred_model_name}' for '{formatted_target_col}' not found in tuned models. Sticking with MAE-best: {best_name}")
+
+    best_model = tuned_models[best_name] # Use the tuned best model
+    best_model_params = model_best_params.get(best_name, {}) # Get the best params for the identified best model
+
+    print(f"\nBest model for {formatted_target_col} (by 10-fold MAE): {best_name}")
+
+    mae_cv_best, rmse_cv_best, r2_cv_best, y_true_cv, y_pred_cv = cv_predictions_for_model(
+        best_model, X, y, n_splits=n_splits, random_state=42
     )
-    all_model_metric_table(results).to_csv(
-        OUTPUT_DIR / "biofloc_all_model_metrics.csv"
+
+    print(f"Best model 10-fold CV for {formatted_target_col}:")
+    print(f"  MAE  = {mae_cv_best:.3f}")
+    print(f"  RMSE = {rmse_cv_best:.3f}")
+    print(f"  R²   = {r2_cv_best:.3f}")
+
+    mae_loo, rmse_loo, r2_loo, y_true_loo, y_pred_loo = loo_evaluation(best_model, X, y)
+
+    print(f"LOO performance for {formatted_target_col}:")
+    print(f"  MAE  = {mae_loo:.3f}")
+    print(f"  RMSE = {rmse_loo:.3f}")
+    print(f"  R²   = {r2_loo:.3f}")
+
+    result = {
+        "target": target_col,
+        "n_samples": len(y),
+        "best_model_name": best_name,
+        "best_model_params": best_model_params, # Add best_model_params to result
+        "cv_metrics": cv_metrics,
+        "cv_best_mae": mae_cv_best,
+        "cv_best_rmse": rmse_cv_best,
+        "cv_best_r2": r2_cv_best,
+        "y_true_cv": y_true_cv,
+        "y_pred_cv": y_pred_cv,
+        "loo_mae": mae_loo,
+        "loo_rmse": rmse_loo,
+        "loo_r2": r2_loo,
+        "y_true_loo": y_true_loo,
+        "y_pred_loo": y_pred_loo,
+    }
+    return result
+
+model_overrides_config = {"TAN_B(mg/L)": "RandomForest"}
+
+small_results_bio = []
+for tgt in targets_bio:
+    res = run_pipeline_target(bio_df, features_bio, tgt, n_splits=10, model_overrides=model_overrides_config)
+    small_results_bio.append(res)
+
+n_panels = len(small_results_bio)
+if n_panels == 0:
+    raise ValueError("No results were generated. Check your targets and input data.")
+
+ncols = 2
+nrows = ceil(n_panels / ncols)
+
+fig, axes = plt.subplots(nrows, ncols, figsize=(10, 4 * nrows), squeeze=False)
+axes = axes.ravel()
+
+handles, labels = [], []
+
+for i, (ax, res) in enumerate(zip(axes, small_results_bio)):
+    y_true = res["y_true_cv"]
+    y_pred = res["y_pred_cv"]
+    idx = np.arange(len(y_true))
+
+    line1, = ax.plot(idx, y_true, label="Observed", linewidth=1)
+    line2, = ax.plot(idx, y_pred, label="Predicted", linewidth=1)
+
+    if i == 0:
+        handles = [line1, line2]
+        labels = ["Observed", "Predicted"]
+
+    ax.set_xlabel("Sample index", fontsize=14)
+    ax.set_ylabel(_format_target_name_for_print(res["target"]), fontsize=14)
+
+    best_model_name = res['best_model_name']
+    display_model_name = best_model_name
+
+    # Check if the best model is KNN and if specific params are available
+    if best_model_name == "KNN":
+        best_params = res.get("best_model_params", {})
+        if "knn__n_neighbors" in best_params:
+            display_model_name = f"{best_model_name} (k={best_params['knn__n_neighbors']})"
+
+    box_text = (
+        f"Best Model: {display_model_name}\n"
+        f"MAE: {res['cv_best_mae']:.3f}\n"
+        f"RMSE: {res['cv_best_rmse']:.3f}\n"
+        f"R²: {res['cv_best_r2']:.3f}"
     )
-    plot_results(results)
 
+    ax.text(
+        0.05, 0.85, box_text,
+        verticalalignment="top",
+        horizontalalignment="left",
+        transform=ax.transAxes,
+        bbox=dict(boxstyle="round,pad=0.5", fc="wheat", alpha=0.5),
+        fontsize=12
+    )
 
-if __name__ == "__main__":
-    main()
+    ax.text(
+        0.02, 0.98, f"({chr(ord('a') + i)})",
+        transform=ax.transAxes,
+        fontsize=16,
+        fontweight="bold",
+        verticalalignment="top"
+    )
+
+for j in range(len(small_results_bio), len(axes)):
+    axes[j].axis("off")
+
+if handles:
+    fig.legend(
+        handles,
+        labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 1.0),
+        ncol=2,
+        fontsize=12
+    )
+
+fig.tight_layout(rect=[0, 0, 1, 0.96])
+
+plt.savefig("biofloc_tank_results.png", dpi=600, bbox_inches="tight")
+plt.show()
+
+# Generate a combined summary table for all models and their metrics for biofloc tank data
+print("\n### Detailed Model Performance by Metric for Biofloc Tank Data")
+
+all_model_metrics_data_bio = {}
+candidate_models_names, _ = get_candidate_models_and_params() # Use the modified function
+
+# Initialize the dictionary for each model
+for model_name in candidate_models_names:
+    all_model_metrics_data_bio[model_name] = {}
+
+# Define a consistent order for metrics
+metric_order = ['MAE', 'RMSE', 'R²']
+
+# Collect all possible column headers first to ensure consistent ordering
+all_column_headers_bio = []
+for tgt in targets_bio:
+    # Format target name and remove unit for brevity
+    formatted_target = _format_target_name_for_print(tgt).replace('(mg/L)', '').strip()
+    for metric in metric_order:
+        all_column_headers_bio.append(f'{formatted_target} {metric}')
+
+# Populate the metrics data
+for res in small_results_bio:
+    target_name_formatted = _format_target_name_for_print(res['target']).replace('(mg/L)', '').strip()
+
+    for model_name, metrics in res['cv_metrics'].items():
+        all_model_metrics_data_bio[model_name][f'{target_name_formatted} MAE'] = f"{metrics['mae']:.3f}"
+        all_model_metrics_data_bio[model_name][f'{target_name_formatted} RMSE'] = f"{metrics['rmse']:.3f}"
+        all_model_metrics_data_bio[model_name][f'{target_name_formatted} R²'] = f"{metrics['r2']:.3f}"
+
+# Create DataFrame from the collected data
+combined_metrics_df_bio = pd.DataFrame.from_dict(all_model_metrics_data_bio, orient='index')
+combined_metrics_df_bio.index.name = 'Model'
+
+# Reorder columns to ensure consistency (target by target, then metric by metric)
+# Filter all_column_headers_bio to only include those actually generated
+valid_column_headers_bio = [col for col in all_column_headers_bio if col in combined_metrics_df_bio.columns]
+combined_metrics_df_bio = combined_metrics_df_bio[valid_column_headers_bio]
+
+display(combined_metrics_df_bio)
