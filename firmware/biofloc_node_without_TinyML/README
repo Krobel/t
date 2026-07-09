@@ -1,0 +1,19 @@
+# Biofloc node without TinyML
+
+This sketch is the biofloc-reactor sensor-only baseline.
+
+It reads Atlas I2C sensors and the RS-485 turbidity sensor, sends the measurements to Blues Notehub, and reports runtime memory. It does not run embedded prediction.
+
+## Included variables
+
+- DO
+- ORP
+- EC
+- pH
+- Temperature
+- Turbidity
+- Runtime heap and PSRAM metrics
+
+## Notes
+
+This is the correct baseline for comparing biofloc deployment with and without TinyML while keeping the turbidity sensor in the firmware.
