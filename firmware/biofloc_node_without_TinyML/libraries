@@ -1,0 +1,17 @@
+Arduino IDE or PlatformIO libraries:
+
+- Arduino core for ESP32
+- Wire
+- Notecard
+- Ezo_i2c
+- Ezo_i2c_util
+- ModbusMaster, required for biofloc turbidity versions only
+
+Board used during development:
+
+- Adafruit Feather ESP32-S3
+
+Notes:
+
+- Select the correct ESP32-S3 board in the Arduino IDE.
+- Replace YOUR_NOTEHUB_PRODUCT_UID with your own Blues Notehub ProductUID.
