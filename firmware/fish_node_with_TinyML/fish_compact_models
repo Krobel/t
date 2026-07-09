@@ -1,0 +1,963 @@
+#ifndef FISH_COMPACT_MODELS_H
+#define FISH_COMPACT_MODELS_H
+
+#include <stdint.h>
+#include <math.h>
+
+/*
+Compact pruned + quantized embedded models for fish-tank data.
+Generated from Colab.
+
+Input order:
+input_raw[0] = DO_F(mg/L)
+input_raw[1] = ORP_F(mV)
+input_raw[2] = pH_F
+input_raw[3] = Temp_F(C)
+
+Targets:
+TAN_F(mg/L)
+TOC_F(mg/L)
+DOC_F(mg/L)
+TN_F(mg/L)
+DN_F(mg/L)
+
+Deployment optimization:
+- Micro RandomForest, AdaBoost, and XGBoost
+- Shallow tree depth
+- Increased minimum leaf size
+- int16_t quantized tree thresholds
+- int16_t quantized tree/KNN outputs
+- int16_t quantized KNN feature matrix
+*/
+
+#define FISH_N_FEATURES 4
+
+static const float fish_feature_min[FISH_N_FEATURES] = {2.0999999f, 47.9391f, 7.01699972f, 25.075f};
+static const float fish_feature_step[FISH_N_FEATURES] = {0.000198675489f, 0.00850736754f, 8.08435401e-05f, 0.000242771691f};
+
+typedef struct {
+    int16_t feature;
+    int16_t threshold_q;
+    int16_t left;
+    int16_t right;
+    int16_t value_q;
+} FishQTreeNode;
+
+static int16_t fish_quantize_feature(float x, int16_t f) {
+    if (!isfinite(x)) return 0;
+    float qf = (x - fish_feature_min[f]) / fish_feature_step[f];
+    if (qf < 0.0f) qf = 0.0f;
+    if (qf > 32767.0f) qf = 32767.0f;
+    return (int16_t)(qf + 0.5f);
+}
+
+static int16_t fish_eval_q_tree_le(const FishQTreeNode *nodes, const float *input) {
+    int16_t node = 0;
+    while (nodes[node].feature >= 0) {
+        int16_t f = nodes[node].feature;
+        int16_t xq = fish_quantize_feature(input[f], f);
+        if (xq <= nodes[node].threshold_q) node = nodes[node].left;
+        else node = nodes[node].right;
+    }
+    return nodes[node].value_q;
+}
+
+static int16_t fish_eval_q_tree_lt(const FishQTreeNode *nodes, const float *input) {
+    int16_t node = 0;
+    while (nodes[node].feature >= 0) {
+        int16_t f = nodes[node].feature;
+        int16_t xq = fish_quantize_feature(input[f], f);
+        if (xq < nodes[node].threshold_q) node = nodes[node].left;
+        else node = nodes[node].right;
+    }
+    return nodes[node].value_q;
+}
+
+
+/* ============================================================
+   Target: TAN_F(mg/L)
+   Selected model: KNN_k3
+   ============================================================ */
+
+/* Quantized KNN_k3 for TAN_F(mg/L) */
+#define PREDICT_TAN_F_MG_L_N_SAMPLES 196
+#define PREDICT_TAN_F_MG_L_K 3
+static const float predict_tan_f_mg_l_mean[FISH_N_FEATURES] = {6.56727033f, 155.516931f, 7.9766796f, 28.331796f};
+static const float predict_tan_f_mg_l_scale[FISH_N_FEATURES] = {0.975401895f, 65.7287114f, 0.458136642f, 1.17632607f};
+static const float predict_tan_f_mg_l_q_multiplier = 1000.0f;
+static const float predict_tan_f_mg_l_y_min = 0.9986785f;
+static const float predict_tan_f_mg_l_y_step = 0.000128753517f;
+
+static const int16_t predict_tan_f_mg_l_xq[PREDICT_TAN_F_MG_L_N_SAMPLES][FISH_N_FEATURES] = {
+    {1059, 791, 33, -331},
+    {1018, 815, 516, -507},
+    {208, 666, 581, -516},
+    {413, 713, 407, -529},
+    {116, 730, 212, -518},
+    {-4580, 777, 605, -660},
+    {-2089, 756, 507, -678},
+    {-1135, 748, 586, -526},
+    {-776, 722, 426, -523},
+    {-489, 605, 588, -511},
+    {-377, 2562, 88, -490},
+    {-315, 2521, 324, -471},
+    {-254, 2604, 699, -458},
+    {-171, 2501, 789, -433},
+    {-305, 2557, 717, -311},
+    {13, 2575, 311, -339},
+    {-7, 2522, 370, -264},
+    {3, 2492, 693, -326},
+    {-715, 2381, 712, -376},
+    {-356, 2454, 311, -374},
+    {-448, 2413, 562, -489},
+    {-264, 2346, 260, -487},
+    {-69, 2317, 247, -779},
+    {-59, 2305, 677, -850},
+    {300, 2402, 134, -1484},
+    {474, 2070, 291, -121},
+    {290, 2206, 103, -912},
+    {813, 2235, -76, -80},
+    {577, 2111, 208, 177},
+    {946, 2306, -445, -783},
+    {474, -54, 697, -1108},
+    {-100, -53, 71, 836},
+    {13, -53, -290, 48},
+    {331, 388, 1472, -1619},
+    {-1063, -54, 75, 418},
+    {1807, -1458, -333, 143},
+    {1479, -1478, -298, -1232},
+    {1346, -1448, 758, 36},
+    {1664, -1442, 758, -143},
+    {1428, -632, 1020, -1234},
+    {1776, -55, -1008, 385},
+    {1961, -52, -586, 460},
+    {2094, -52, -1329, -436},
+    {1940, -49, -1287, 1123},
+    {2094, -53, 27, 951},
+    {1971, -53, -1497, -421},
+    {1746, -50, -1049, 1062},
+    {-315, -56, -689, 989},
+    {177, -51, -65, -53},
+    {3, -53, -1534, 1518},
+    {-171, -51, -678, 1729},
+    {536, -52, -846, 565},
+    {-377, -54, -274, 1404},
+    {-223, -51, 162, 1991},
+    {-264, -53, -152, 1502},
+    {-1238, -53, -63, 2316},
+    {-1443, -54, 234, 2885},
+    {-377, -53, -1032, 1882},
+    {-161, -50, -861, 2434},
+    {218, -53, -774, 2312},
+    {-192, -49, -761, -1459},
+    {1418, -51, 815, -660},
+    {1284, -81, 578, -627},
+    {515, -49, -427, -812},
+    {-981, -51, -357, -320},
+    {-1104, -1070, -45, -675},
+    {-1248, -52, -683, -951},
+    {-1279, -1445, -480, -90},
+    {1284, -894, 108, -665},
+    {1418, -1469, -669, -1524},
+    {987, -53, -870, 1213},
+    {198, -54, -370, -7},
+    {-59, -49, 387, -926},
+    {167, -53, -680, -13},
+    {884, -53, -248, -2},
+    {433, -54, -652, 79},
+    {-243, -1347, -89, 376},
+    {-182, -61, 466, 252},
+    {116, -52, 883, -788},
+    {-223, -53, -525, -622},
+    {-674, -54, 581, -323},
+    {731, -50, -608, 407},
+    {187, -52, -731, 519},
+    {-161, -53, -261, -286},
+    {-438, -62, -1080, -770},
+    {-715, -52, 343, -59},
+    {-377, -121, -1645, -280},
+    {-295, -53, -2095, 185},
+    {-1268, -52, -517, 632},
+    {-387, -53, -1990, -1037},
+    {-571, -51, -399, 212},
+    {-992, -53, -720, -18},
+    {-233, -50, -233, -779},
+    {-295, -53, -521, 95},
+    {-202, -53, -143, -186},
+    {-1166, -49, 79, -1097},
+    {-325, -52, -305, -204},
+    {1459, -1129, 228, 679},
+    {946, -542, -1436, -457},
+    {1418, -54, 306, -116},
+    {1448, -52, -1449, 2138},
+    {1694, -54, -955, 159},
+    {1418, -52, 226, -834},
+    {1069, -52, -344, 451},
+    {-428, -51, -1270, -926},
+    {731, -50, -608, 407},
+    {187, -52, -731, 519},
+    {-161, -53, -261, -286},
+    {-438, -62, -1080, -770},
+    {-715, -52, 343, -59},
+    {-377, -121, -1645, -280},
+    {-295, -53, -2095, 185},
+    {-1268, -52, -517, 632},
+    {-387, -53, -1990, -1037},
+    {-571, -51, -399, 212},
+    {-992, -53, -720, -18},
+    {-233, -50, -233, -779},
+    {-295, -53, -521, 95},
+    {-202, -53, -143, -186},
+    {-1166, -49, 79, -1097},
+    {-325, -52, -305, -204},
+    {1459, -1129, 228, 679},
+    {946, -542, -1436, -457},
+    {1418, -54, 306, -116},
+    {1448, -52, -1449, 2138},
+    {1694, -54, -955, 159},
+    {495, 455, -69, -101},
+    {905, 360, 182, 305},
+    {1315, 358, -87, -64},
+    {833, 428, -346, -301},
+    {556, 32, -340, 1019},
+    {454, 386, 322, -151},
+    {382, -1181, 706, 121},
+    {105, -136, 40, -320},
+    {-233, 598, -477, 651},
+    {239, 662, 680, 322},
+    {-541, 637, -907, 962},
+    {-592, 578, -174, -172},
+    {-212, 487, -803, 947},
+    {-715, 629, 90, 787},
+    {444, 773, 90, -680},
+    {925, 799, -584, -2769},
+    {-561, 342, -279, 339},
+    {-561, 379, 789, 446},
+    {218, 711, 535, 645},
+    {-7, -230, -226, 182},
+    {-448, 384, 199, 122},
+    {126, 357, 509, 340},
+    {-387, -345, -951, 542},
+    {290, 403, 821, -523},
+    {-233, 224, -253, 765},
+    {-469, -975, -1093, -936},
+    {-130, -513, 518, -1566},
+    {987, -610, -676, -2536},
+    {-305, -538, -619, -511},
+    {136, -338, -305, -596},
+    {-684, -571, 226, -367},
+    {-684, -875, -167, -537},
+    {-684, -875, -167, -537},
+    {-1258, -723, -322, -624},
+    {-1227, -723, -968, -185},
+    {-1406, -799, -1043, -367},
+    {-1443, -692, 90, -106},
+    {-1084, -601, -466, -905},
+    {-1730, -799, -846, -774},
+    {-377, -784, 291, -170},
+    {-992, -799, -999, -210},
+    {-1166, -890, 42, -62},
+    {-1709, -723, -824, -966},
+    {-1566, -708, -1265, -1398},
+    {-1935, -829, 18, -1232},
+    {-2099, -632, -543, -599},
+    {-2201, -662, -379, -1126},
+    {-2283, -510, 298, -985},
+    {-2058, -571, -198, 63},
+    {-2407, -753, -982, -1442},
+    {-489, -1488, 1583, 345},
+    {382, -1614, 1520, 1041},
+    {239, -1637, 2159, 747},
+    {464, -1513, 520, -1253},
+    {13, -1466, 712, 3994},
+    {54, -1598, 1797, 2043},
+    {638, -784, 1531, -413},
+    {946, -1179, 741, 2964},
+    {-18, -1605, 2142, 2203},
+    {403, -769, 845, -972},
+    {936, -1438, 2930, 320},
+    {884, -1362, 3406, -234},
+    {1305, -1465, 2149, 777},
+    {556, -1534, 3465, 790},
+    {-79, -1214, 1743, -230},
+    {290, -1347, 3687, 3354},
+    {823, -1500, 2485, 3087},
+    {751, -678, 1937, 193},
+    {1243, -799, 2779, 620},
+    {-7, -753, 3406, 476},
+};
+
+static const int16_t predict_tan_f_mg_l_yq[PREDICT_TAN_F_MG_L_N_SAMPLES] = {2056, 2015, 2873, 3355, 3550, 805, 6537, 4979, 5701, 7690, 7983, 7398, 10816, 12318, 9769, 10865, 11627, 12091, 13573, 14868, 13459, 15812, 15706, 29168, 24037, 30576, 29477, 32767, 28541, 27620, 6583, 6087, 5965, 4888, 8726, 4997, 1982, 1376, 2272, 1945, 1630, 1291, 1449, 2006, 904, 1643, 3750, 1902, 2460, 8189, 6135, 3239, 3903, 3439, 1828, 3703, 964, 1870, 3344, 2881, 2881, 7837, 3180, 3291, 6185, 2825, 4300, 9821, 2526, 1251, 6684, 1772, 5353, 8901, 3779, 4854, 9378, 4422, 4451, 8627, 14201, 0, 4078, 1665, 2971, 6331, 3131, 7587, 10309, 4347, 5125, 7647, 4636, 2313, 5882, 7169, 10279, 11306, 5804, 5481, 3030, 2395, 2052, 5945, 6550, 802, 3265, 1973, 2801, 5684, 2945, 3895, 6833, 4204, 5795, 5508, 4138, 4580, 6380, 3707, 4834, 6723, 3953, 1268, 4949, 6002, 3270, 3462, 1631, 2510, 7417, 5418, 6768, 11602, 6465, 4048, 8463, 3797, 13673, 8882, 3169, 2447, 6392, 3263, 3054, 6360, 3734, 4738, 10409, 2625, 5502, 7040, 4163, 3828, 6297, 2426, 6561, 5959, 5429, 3202, 4791, 6188, 4972, 5454, 7404, 5080, 7307, 5020, 4575, 6946, 6958, 4647, 2865, 1698, 5116, 4876, 11800, 24211, 24933, 11403, 10994, 12221, 4565, 6901, 10115, 5288, 22557, 22234, 25363, 21975, 15586, 18047, 15953, 5658, 11637, 12673};
+
+float predict_tan_f_mg_l(const float input_raw[FISH_N_FEATURES]) {
+    int16_t input_q[FISH_N_FEATURES];
+    for (int j = 0; j < FISH_N_FEATURES; j++) {
+        float z = (input_raw[j] - predict_tan_f_mg_l_mean[j]) / predict_tan_f_mg_l_scale[j];
+        float qf = z * predict_tan_f_mg_l_q_multiplier;
+        if (qf > 32767.0f) qf = 32767.0f;
+        if (qf < -32768.0f) qf = -32768.0f;
+        if (qf >= 0.0f) input_q[j] = (int16_t)(qf + 0.5f);
+        else input_q[j] = (int16_t)(qf - 0.5f);
+    }
+
+    long long best_dist[PREDICT_TAN_F_MG_L_K];
+    int16_t best_yq[PREDICT_TAN_F_MG_L_K];
+    for (int k = 0; k < PREDICT_TAN_F_MG_L_K; k++) {
+        best_dist[k] = 9223372036854775807LL;
+        best_yq[k] = 0;
+    }
+
+    for (int i = 0; i < PREDICT_TAN_F_MG_L_N_SAMPLES; i++) {
+        long long dist = 0;
+        for (int j = 0; j < FISH_N_FEATURES; j++) {
+            long long diff = (long long)input_q[j] - (long long)predict_tan_f_mg_l_xq[i][j];
+            dist += diff * diff;
+        }
+        int worst_index = 0;
+        long long worst_dist = best_dist[0];
+        for (int k = 1; k < PREDICT_TAN_F_MG_L_K; k++) {
+            if (best_dist[k] > worst_dist) {
+                worst_dist = best_dist[k];
+                worst_index = k;
+            }
+        }
+        if (dist < worst_dist) {
+            best_dist[worst_index] = dist;
+            best_yq[worst_index] = predict_tan_f_mg_l_yq[i];
+        }
+    }
+
+    long sum_q = 0;
+    for (int k = 0; k < PREDICT_TAN_F_MG_L_K; k++) sum_q += best_yq[k];
+    float avg_q = (float)sum_q / (float)PREDICT_TAN_F_MG_L_K;
+    float pred = predict_tan_f_mg_l_y_min + (avg_q * predict_tan_f_mg_l_y_step);
+    if (pred < 0.0f) pred = 0.0f;
+    return pred;
+}
+
+
+/* ============================================================
+   Target: TOC_F(mg/L)
+   Selected model: XGBoost
+   ============================================================ */
+
+/* Quantized micro XGBoost for TOC_F(mg/L) */
+#define PREDICT_TOC_F_MG_L_N_TREES 12
+static const float predict_toc_f_mg_l_base_score = 59.91584f;
+static const float predict_toc_f_mg_l_leaf_min = -0.940977573f;
+static const float predict_toc_f_mg_l_leaf_step = 5.02241394e-05f;
+
+static const FishQTreeNode predict_toc_f_mg_l_tree_0[] = {
+    {3, 12028, 1, 4, 0},
+    {2, 5925, 2, 3, 0},
+    {-1, 0, -1, -1, 7253},
+    {-1, 0, -1, -1, 32767},
+    {1, 12268, 5, 6, 0},
+    {-1, 0, -1, -1, 7232},
+    {-1, 0, -1, -1, 24681},
+};
+
+static const FishQTreeNode predict_toc_f_mg_l_tree_1[] = {
+    {3, 11958, 1, 4, 0},
+    {2, 5925, 2, 3, 0},
+    {-1, 0, -1, -1, 7608},
+    {-1, 0, -1, -1, 29993},
+    {1, 12231, 5, 6, 0},
+    {-1, 0, -1, -1, 21133},
+    {-1, 0, -1, -1, 5404},
+};
+
+static const FishQTreeNode predict_toc_f_mg_l_tree_2[] = {
+    {2, 5961, 1, 2, 0},
+    {-1, 0, -1, -1, 778},
+    {3, 11908, 3, 4, 0},
+    {-1, 0, -1, -1, 30747},
+    {-1, 0, -1, -1, 16984},
+};
+
+static const FishQTreeNode predict_toc_f_mg_l_tree_3[] = {
+    {2, 5961, 1, 2, 0},
+    {-1, 0, -1, -1, 1198},
+    {3, 12028, 3, 4, 0},
+    {-1, 0, -1, -1, 30708},
+    {-1, 0, -1, -1, 17668},
+};
+
+static const FishQTreeNode predict_toc_f_mg_l_tree_4[] = {
+    {3, 12028, 1, 4, 0},
+    {1, 12270, 2, 3, 0},
+    {-1, 0, -1, -1, 30501},
+    {-1, 0, -1, -1, 20256},
+    {1, 12268, 5, 6, 0},
+    {-1, 0, -1, -1, 7052},
+    {-1, 0, -1, -1, 25702},
+};
+
+static const FishQTreeNode predict_toc_f_mg_l_tree_5[] = {
+    {2, 5961, 1, 2, 0},
+    {-1, 0, -1, -1, 0},
+    {1, 12214, 3, 4, 0},
+    {-1, 0, -1, -1, 30104},
+    {-1, 0, -1, -1, 17015},
+};
+
+static const FishQTreeNode predict_toc_f_mg_l_tree_6[] = {
+    {2, 5961, 1, 2, 0},
+    {-1, 0, -1, -1, 1148},
+    {3, 12028, 3, 4, 0},
+    {-1, 0, -1, -1, 27467},
+    {-1, 0, -1, -1, 15721},
+};
+
+static const FishQTreeNode predict_toc_f_mg_l_tree_7[] = {
+    {3, 11908, 1, 4, 0},
+    {2, 5925, 2, 3, 0},
+    {-1, 0, -1, -1, 9307},
+    {-1, 0, -1, -1, 29308},
+    {3, 17037, 5, 6, 0},
+    {-1, 0, -1, -1, 5398},
+    {-1, 0, -1, -1, 22109},
+};
+
+static const FishQTreeNode predict_toc_f_mg_l_tree_8[] = {
+    {2, 5925, 1, 2, 0},
+    {-1, 0, -1, -1, 3600},
+    {3, 11908, 3, 4, 0},
+    {-1, 0, -1, -1, 30923},
+    {-1, 0, -1, -1, 15366},
+};
+
+static const FishQTreeNode predict_toc_f_mg_l_tree_9[] = {
+    {0, 28891, 1, 4, 0},
+    {1, 12232, 2, 3, 0},
+    {-1, 0, -1, -1, 31958},
+    {-1, 0, -1, -1, 15608},
+    {-1, 0, -1, -1, 5447},
+};
+
+static const FishQTreeNode predict_toc_f_mg_l_tree_10[] = {
+    {2, 4700, 1, 2, 0},
+    {-1, 0, -1, -1, 2125},
+    {2, 22847, 3, 4, 0},
+    {-1, 0, -1, -1, 21495},
+    {-1, 0, -1, -1, 4571},
+};
+
+static const FishQTreeNode predict_toc_f_mg_l_tree_11[] = {
+    {0, 27331, 1, 4, 0},
+    {2, 4700, 2, 3, 0},
+    {-1, 0, -1, -1, 5129},
+    {-1, 0, -1, -1, 23395},
+    {3, 12827, 5, 6, 0},
+    {-1, 0, -1, -1, 18196},
+    {-1, 0, -1, -1, 2822},
+};
+
+static const FishQTreeNode* const predict_toc_f_mg_l_trees[PREDICT_TOC_F_MG_L_N_TREES] = {
+    predict_toc_f_mg_l_tree_0,
+    predict_toc_f_mg_l_tree_1,
+    predict_toc_f_mg_l_tree_2,
+    predict_toc_f_mg_l_tree_3,
+    predict_toc_f_mg_l_tree_4,
+    predict_toc_f_mg_l_tree_5,
+    predict_toc_f_mg_l_tree_6,
+    predict_toc_f_mg_l_tree_7,
+    predict_toc_f_mg_l_tree_8,
+    predict_toc_f_mg_l_tree_9,
+    predict_toc_f_mg_l_tree_10,
+    predict_toc_f_mg_l_tree_11,
+};
+
+float predict_toc_f_mg_l(const float input_raw[FISH_N_FEATURES]) {
+    float pred = predict_toc_f_mg_l_base_score;
+    for (int i = 0; i < PREDICT_TOC_F_MG_L_N_TREES; i++) {
+        int16_t leaf_q = fish_eval_q_tree_lt(predict_toc_f_mg_l_trees[i], input_raw);
+        pred += predict_toc_f_mg_l_leaf_min + ((float)leaf_q * predict_toc_f_mg_l_leaf_step);
+    }
+    if (pred < 0.0f) pred = 0.0f;
+    return pred;
+}
+
+
+/* ============================================================
+   Target: DOC_F(mg/L)
+   Selected model: XGBoost
+   ============================================================ */
+
+/* Quantized micro XGBoost for DOC_F(mg/L) */
+#define PREDICT_DOC_F_MG_L_N_TREES 12
+static const float predict_doc_f_mg_l_base_score = 29.890259f;
+static const float predict_doc_f_mg_l_leaf_min = -0.556561172f;
+static const float predict_doc_f_mg_l_leaf_step = 5.01268042e-05f;
+
+static const FishQTreeNode predict_doc_f_mg_l_tree_0[] = {
+    {3, 13589, 1, 4, 0},
+    {2, 5925, 2, 3, 0},
+    {-1, 0, -1, -1, 3048},
+    {-1, 0, -1, -1, 19125},
+    {2, 13273, 5, 6, 0},
+    {-1, 0, -1, -1, 918},
+    {-1, 0, -1, -1, 9918},
+};
+
+static const FishQTreeNode predict_doc_f_mg_l_tree_1[] = {
+    {3, 13877, 1, 4, 0},
+    {2, 7966, 2, 3, 0},
+    {-1, 0, -1, -1, 4222},
+    {-1, 0, -1, -1, 18398},
+    {1, 12217, 5, 6, 0},
+    {-1, 0, -1, -1, 11505},
+    {-1, 0, -1, -1, 0},
+};
+
+static const FishQTreeNode predict_doc_f_mg_l_tree_2[] = {
+    {3, 15282, 1, 4, 0},
+    {2, 6482, 2, 3, 0},
+    {-1, 0, -1, -1, 4346},
+    {-1, 0, -1, -1, 17245},
+    {3, 18857, 5, 6, 0},
+    {-1, 0, -1, -1, 1039},
+    {-1, 0, -1, -1, 8156},
+};
+
+static const FishQTreeNode predict_doc_f_mg_l_tree_3[] = {
+    {3, 13877, 1, 4, 0},
+    {2, 5925, 2, 3, 0},
+    {-1, 0, -1, -1, 4163},
+    {-1, 0, -1, -1, 18152},
+    {2, 10465, 5, 6, 0},
+    {-1, 0, -1, -1, 1936},
+    {-1, 0, -1, -1, 9212},
+};
+
+static const FishQTreeNode predict_doc_f_mg_l_tree_4[] = {
+    {3, 11958, 1, 4, 0},
+    {1, 12270, 2, 3, 0},
+    {-1, 0, -1, -1, 19850},
+    {-1, 0, -1, -1, 11226},
+    {1, 2242, 5, 6, 0},
+    {-1, 0, -1, -1, 11480},
+    {-1, 0, -1, -1, 1869},
+};
+
+static const FishQTreeNode predict_doc_f_mg_l_tree_5[] = {
+    {3, 13877, 1, 4, 0},
+    {2, 5925, 2, 3, 0},
+    {-1, 0, -1, -1, 3414},
+    {-1, 0, -1, -1, 18361},
+    {1, 12217, 5, 6, 0},
+    {-1, 0, -1, -1, 12014},
+    {-1, 0, -1, -1, 132},
+};
+
+static const FishQTreeNode predict_doc_f_mg_l_tree_6[] = {
+    {3, 13877, 1, 4, 0},
+    {2, 7966, 2, 3, 0},
+    {-1, 0, -1, -1, 4591},
+    {-1, 0, -1, -1, 17377},
+    {2, 13273, 5, 6, 0},
+    {-1, 0, -1, -1, 2802},
+    {-1, 0, -1, -1, 10424},
+};
+
+static const FishQTreeNode predict_doc_f_mg_l_tree_7[] = {
+    {3, 11958, 1, 4, 0},
+    {2, 5925, 2, 3, 0},
+    {-1, 0, -1, -1, 4589},
+    {-1, 0, -1, -1, 18980},
+    {3, 13350, 5, 6, 0},
+    {-1, 0, -1, -1, 1041},
+    {-1, 0, -1, -1, 7523},
+};
+
+static const FishQTreeNode predict_doc_f_mg_l_tree_8[] = {
+    {3, 10512, 1, 4, 0},
+    {3, 8807, 2, 3, 0},
+    {-1, 0, -1, -1, 8466},
+    {-1, 0, -1, -1, 32767},
+    {2, 8943, 5, 6, 0},
+    {-1, 0, -1, -1, 3622},
+    {-1, 0, -1, -1, 9884},
+};
+
+static const FishQTreeNode predict_doc_f_mg_l_tree_9[] = {
+    {3, 11863, 1, 4, 0},
+    {3, 8704, 2, 3, 0},
+    {-1, 0, -1, -1, 5191},
+    {-1, 0, -1, -1, 22341},
+    {1, 12240, 5, 6, 0},
+    {-1, 0, -1, -1, 10973},
+    {-1, 0, -1, -1, 24},
+};
+
+static const FishQTreeNode predict_doc_f_mg_l_tree_10[] = {
+    {2, 7558, 1, 4, 0},
+    {0, 20385, 2, 3, 0},
+    {-1, 0, -1, -1, 9777},
+    {-1, 0, -1, -1, 1611},
+    {2, 9908, 5, 6, 0},
+    {-1, 0, -1, -1, 19419},
+    {-1, 0, -1, -1, 9531},
+};
+
+static const FishQTreeNode predict_doc_f_mg_l_tree_11[] = {
+    {0, 26928, 1, 4, 0},
+    {3, 15282, 2, 3, 0},
+    {-1, 0, -1, -1, 14185},
+    {-1, 0, -1, -1, 6047},
+    {-1, 0, -1, -1, 1540},
+};
+
+static const FishQTreeNode* const predict_doc_f_mg_l_trees[PREDICT_DOC_F_MG_L_N_TREES] = {
+    predict_doc_f_mg_l_tree_0,
+    predict_doc_f_mg_l_tree_1,
+    predict_doc_f_mg_l_tree_2,
+    predict_doc_f_mg_l_tree_3,
+    predict_doc_f_mg_l_tree_4,
+    predict_doc_f_mg_l_tree_5,
+    predict_doc_f_mg_l_tree_6,
+    predict_doc_f_mg_l_tree_7,
+    predict_doc_f_mg_l_tree_8,
+    predict_doc_f_mg_l_tree_9,
+    predict_doc_f_mg_l_tree_10,
+    predict_doc_f_mg_l_tree_11,
+};
+
+float predict_doc_f_mg_l(const float input_raw[FISH_N_FEATURES]) {
+    float pred = predict_doc_f_mg_l_base_score;
+    for (int i = 0; i < PREDICT_DOC_F_MG_L_N_TREES; i++) {
+        int16_t leaf_q = fish_eval_q_tree_lt(predict_doc_f_mg_l_trees[i], input_raw);
+        pred += predict_doc_f_mg_l_leaf_min + ((float)leaf_q * predict_doc_f_mg_l_leaf_step);
+    }
+    if (pred < 0.0f) pred = 0.0f;
+    return pred;
+}
+
+
+/* ============================================================
+   Target: TN_F(mg/L)
+   Selected model: AdaBoost
+   ============================================================ */
+
+/* Quantized micro AdaBoostRegressor for TN_F(mg/L) */
+#define PREDICT_TN_F_MG_L_N_TREES 10
+static const float predict_tn_f_mg_l_y_min = 5.92147417f;
+static const float predict_tn_f_mg_l_y_step = 0.00168939321f;
+static const float predict_tn_f_mg_l_weights[PREDICT_TN_F_MG_L_N_TREES] = {0.0430579089f, 0.0473040848f, 0.0400563296f, 0.0498316704f, 0.0330333852f, 0.0559355482f, 0.0560800717f, 0.03461011f, 0.0377368749f, 0.0528066916f};
+
+static const FishQTreeNode predict_tn_f_mg_l_tree_0[] = {
+    {0, 29470, 1, 4, 0},
+    {1, 12232, 2, 3, 0},
+    {-1, 0, -1, -1, 15558},
+    {-1, 0, -1, -1, 9431},
+    {0, 31131, 5, 6, 0},
+    {-1, 0, -1, -1, 1915},
+    {-1, 0, -1, -1, 4007},
+};
+
+static const FishQTreeNode predict_tn_f_mg_l_tree_1[] = {
+    {2, 4688, 1, 4, 0},
+    {0, 24814, 2, 3, 0},
+    {-1, 0, -1, -1, 3141},
+    {-1, 0, -1, -1, 2310},
+    {0, 28841, 5, 6, 0},
+    {-1, 0, -1, -1, 13044},
+    {-1, 0, -1, -1, 4491},
+};
+
+static const FishQTreeNode predict_tn_f_mg_l_tree_2[] = {
+    {1, 11652, 1, 4, 0},
+    {2, 25030, 2, 3, 0},
+    {-1, 0, -1, -1, 19578},
+    {-1, 0, -1, -1, 3913},
+    {2, 6593, 5, 6, 0},
+    {-1, 0, -1, -1, 3033},
+    {-1, 0, -1, -1, 10908},
+};
+
+static const FishQTreeNode predict_tn_f_mg_l_tree_3[] = {
+    {0, 28942, 1, 4, 0},
+    {1, 12232, 2, 3, 0},
+    {-1, 0, -1, -1, 17137},
+    {-1, 0, -1, -1, 9841},
+    {3, 10796, 5, 6, 0},
+    {-1, 0, -1, -1, 5739},
+    {-1, 0, -1, -1, 2145},
+};
+
+static const FishQTreeNode predict_tn_f_mg_l_tree_4[] = {
+    {0, 29470, 1, 4, 0},
+    {1, 1321, 2, 3, 0},
+    {-1, 0, -1, -1, 25081},
+    {-1, 0, -1, -1, 12426},
+    {0, 30276, 5, 6, 0},
+    {-1, 0, -1, -1, 2214},
+    {-1, 0, -1, -1, 4346},
+};
+
+static const FishQTreeNode predict_tn_f_mg_l_tree_5[] = {
+    {1, 12193, 1, 4, 0},
+    {2, 16019, 2, 3, 0},
+    {-1, 0, -1, -1, 18702},
+    {-1, 0, -1, -1, 6976},
+    {1, 12267, 5, 6, 0},
+    {-1, 0, -1, -1, 6135},
+    {-1, 0, -1, -1, 12244},
+};
+
+static const FishQTreeNode predict_tn_f_mg_l_tree_6[] = {
+    {0, 29017, 1, 4, 0},
+    {1, 12232, 2, 3, 0},
+    {-1, 0, -1, -1, 16424},
+    {-1, 0, -1, -1, 10133},
+    {3, 14695, 5, 6, 0},
+    {-1, 0, -1, -1, 2257},
+    {-1, 0, -1, -1, 3003},
+};
+
+static const FishQTreeNode predict_tn_f_mg_l_tree_7[] = {
+    {0, 29470, 1, 4, 0},
+    {1, 11652, 2, 3, 0},
+    {-1, 0, -1, -1, 17196},
+    {-1, 0, -1, -1, 11001},
+    {2, 6308, 5, 6, 0},
+    {-1, 0, -1, -1, 2956},
+    {-1, 0, -1, -1, 2006},
+};
+
+static const FishQTreeNode predict_tn_f_mg_l_tree_8[] = {
+    {0, 28841, 1, 4, 0},
+    {1, 8229, 2, 3, 0},
+    {-1, 0, -1, -1, 19746},
+    {-1, 0, -1, -1, 10778},
+    {1, 12242, 5, 6, 0},
+    {-1, 0, -1, -1, 2367},
+    {-1, 0, -1, -1, 8581},
+};
+
+static const FishQTreeNode predict_tn_f_mg_l_tree_9[] = {
+    {0, 29017, 1, 4, 0},
+    {1, 12093, 2, 3, 0},
+    {-1, 0, -1, -1, 16769},
+    {-1, 0, -1, -1, 11246},
+    {1, 12222, 5, 6, 0},
+    {-1, 0, -1, -1, 5103},
+    {-1, 0, -1, -1, 2422},
+};
+
+static const FishQTreeNode* const predict_tn_f_mg_l_trees[PREDICT_TN_F_MG_L_N_TREES] = {
+    predict_tn_f_mg_l_tree_0,
+    predict_tn_f_mg_l_tree_1,
+    predict_tn_f_mg_l_tree_2,
+    predict_tn_f_mg_l_tree_3,
+    predict_tn_f_mg_l_tree_4,
+    predict_tn_f_mg_l_tree_5,
+    predict_tn_f_mg_l_tree_6,
+    predict_tn_f_mg_l_tree_7,
+    predict_tn_f_mg_l_tree_8,
+    predict_tn_f_mg_l_tree_9,
+};
+
+float predict_tn_f_mg_l(const float input_raw[FISH_N_FEATURES]) {
+    int16_t preds[PREDICT_TN_F_MG_L_N_TREES];
+    float weights[PREDICT_TN_F_MG_L_N_TREES];
+    for (int i = 0; i < PREDICT_TN_F_MG_L_N_TREES; i++) {
+        preds[i] = fish_eval_q_tree_le(predict_tn_f_mg_l_trees[i], input_raw);
+        weights[i] = predict_tn_f_mg_l_weights[i];
+    }
+
+    for (int i = 1; i < PREDICT_TN_F_MG_L_N_TREES; i++) {
+        int16_t p = preds[i];
+        float w = weights[i];
+        int j = i - 1;
+        while (j >= 0 && preds[j] > p) {
+            preds[j + 1] = preds[j];
+            weights[j + 1] = weights[j];
+            j--;
+        }
+        preds[j + 1] = p;
+        weights[j + 1] = w;
+    }
+
+    float total_weight = 0.0f;
+    for (int i = 0; i < PREDICT_TN_F_MG_L_N_TREES; i++) total_weight += weights[i];
+    float threshold = 0.5f * total_weight;
+    float cumulative = 0.0f;
+    int16_t pred_q = preds[0];
+    for (int i = 0; i < PREDICT_TN_F_MG_L_N_TREES; i++) {
+        cumulative += weights[i];
+        if (cumulative >= threshold) {
+            pred_q = preds[i];
+            break;
+        }
+    }
+    float pred = predict_tn_f_mg_l_y_min + ((float)pred_q * predict_tn_f_mg_l_y_step);
+    if (pred < 0.0f) pred = 0.0f;
+    return pred;
+}
+
+
+/* ============================================================
+   Target: DN_F(mg/L)
+   Selected model: RandomForest
+   ============================================================ */
+
+/* Quantized micro RandomForest for DN_F(mg/L) */
+#define PREDICT_DN_F_MG_L_N_TREES 8
+static const float predict_dn_f_mg_l_y_min = 4.748006f;
+static const float predict_dn_f_mg_l_y_step = 0.00149026302f;
+
+static const FishQTreeNode predict_dn_f_mg_l_tree_0[] = {
+    {1, 12252, 1, 6, 0},
+    {0, 28942, 2, 5, 0},
+    {2, 6710, 3, 4, 0},
+    {-1, 0, -1, -1, 6169},
+    {-1, 0, -1, -1, 13893},
+    {-1, 0, -1, -1, 5627},
+    {3, 11544, 7, 10, 0},
+    {0, 21442, 8, 9, 0},
+    {-1, 0, -1, -1, 4596},
+    {-1, 0, -1, -1, 8722},
+    {1, 14833, 11, 12, 0},
+    {-1, 0, -1, -1, 3935},
+    {-1, 0, -1, -1, 2356},
+};
+
+static const FishQTreeNode predict_dn_f_mg_l_tree_1[] = {
+    {1, 12583, 1, 8, 0},
+    {3, 13838, 2, 5, 0},
+    {0, 22021, 3, 4, 0},
+    {-1, 0, -1, -1, 8955},
+    {-1, 0, -1, -1, 17949},
+    {1, 1888, 6, 7, 0},
+    {-1, 0, -1, -1, 11252},
+    {-1, 0, -1, -1, 6530},
+    {3, 11702, 9, 10, 0},
+    {-1, 0, -1, -1, 6230},
+    {2, 13211, 11, 12, 0},
+    {-1, 0, -1, -1, 2327},
+    {-1, 0, -1, -1, 3261},
+};
+
+static const FishQTreeNode predict_dn_f_mg_l_tree_2[] = {
+    {1, 12239, 1, 8, 0},
+    {3, 11857, 2, 5, 0},
+    {3, 10042, 3, 4, 0},
+    {-1, 0, -1, -1, 9830},
+    {-1, 0, -1, -1, 21106},
+    {3, 12876, 6, 7, 0},
+    {-1, 0, -1, -1, 4707},
+    {-1, 0, -1, -1, 11385},
+    {1, 12259, 9, 12, 0},
+    {2, 9729, 10, 11, 0},
+    {-1, 0, -1, -1, 5117},
+    {-1, 0, -1, -1, 10581},
+    {1, 18182, 13, 14, 0},
+    {-1, 0, -1, -1, 2508},
+    {-1, 0, -1, -1, 4976},
+};
+
+static const FishQTreeNode predict_dn_f_mg_l_tree_3[] = {
+    {1, 7352, 1, 6, 0},
+    {0, 18573, 2, 3, 0},
+    {-1, 0, -1, -1, 17951},
+    {1, 1311, 4, 5, 0},
+    {-1, 0, -1, -1, 14105},
+    {-1, 0, -1, -1, 7766},
+    {3, 10909, 7, 10, 0},
+    {3, 8724, 8, 9, 0},
+    {-1, 0, -1, -1, 3782},
+    {-1, 0, -1, -1, 16036},
+    {3, 18468, 11, 12, 0},
+    {-1, 0, -1, -1, 4773},
+    {-1, 0, -1, -1, 10028},
+};
+
+static const FishQTreeNode predict_dn_f_mg_l_tree_4[] = {
+    {1, 12269, 1, 8, 0},
+    {1, 5826, 2, 5, 0},
+    {3, 13352, 3, 4, 0},
+    {-1, 0, -1, -1, 21710},
+    {-1, 0, -1, -1, 10632},
+    {3, 11945, 6, 7, 0},
+    {-1, 0, -1, -1, 13937},
+    {-1, 0, -1, -1, 7615},
+    {1, 17974, 9, 10, 0},
+    {-1, 0, -1, -1, 2671},
+    {3, 10891, 11, 12, 0},
+    {-1, 0, -1, -1, 6922},
+    {-1, 0, -1, -1, 4283},
+};
+
+static const FishQTreeNode predict_dn_f_mg_l_tree_5[] = {
+    {3, 11886, 1, 8, 0},
+    {3, 10137, 2, 5, 0},
+    {3, 7439, 3, 4, 0},
+    {-1, 0, -1, -1, 8750},
+    {-1, 0, -1, -1, 5486},
+    {2, 12586, 6, 7, 0},
+    {-1, 0, -1, -1, 21090},
+    {-1, 0, -1, -1, 9451},
+    {1, 1508, 9, 10, 0},
+    {-1, 0, -1, -1, 14092},
+    {3, 18015, 11, 12, 0},
+    {-1, 0, -1, -1, 4189},
+    {-1, 0, -1, -1, 8838},
+};
+
+static const FishQTreeNode predict_dn_f_mg_l_tree_6[] = {
+    {1, 12583, 1, 8, 0},
+    {3, 10452, 2, 5, 0},
+    {2, 11263, 3, 4, 0},
+    {-1, 0, -1, -1, 9455},
+    {-1, 0, -1, -1, 19672},
+    {0, 19429, 6, 7, 0},
+    {-1, 0, -1, -1, 12229},
+    {-1, 0, -1, -1, 6544},
+    {2, 13025, 9, 10, 0},
+    {-1, 0, -1, -1, 2110},
+    {3, 10949, 11, 12, 0},
+    {-1, 0, -1, -1, 5965},
+    {-1, 0, -1, -1, 3689},
+};
+
+static const FishQTreeNode predict_dn_f_mg_l_tree_7[] = {
+    {1, 12269, 1, 8, 0},
+    {3, 13486, 2, 5, 0},
+    {2, 14976, 3, 4, 0},
+    {-1, 0, -1, -1, 11113},
+    {-1, 0, -1, -1, 19683},
+    {3, 16870, 6, 7, 0},
+    {-1, 0, -1, -1, 5430},
+    {-1, 0, -1, -1, 11598},
+    {2, 14070, 9, 12, 0},
+    {3, 11095, 10, 11, 0},
+    {-1, 0, -1, -1, 4417},
+    {-1, 0, -1, -1, 2293},
+    {-1, 0, -1, -1, 5661},
+};
+
+static const FishQTreeNode* const predict_dn_f_mg_l_trees[PREDICT_DN_F_MG_L_N_TREES] = {
+    predict_dn_f_mg_l_tree_0,
+    predict_dn_f_mg_l_tree_1,
+    predict_dn_f_mg_l_tree_2,
+    predict_dn_f_mg_l_tree_3,
+    predict_dn_f_mg_l_tree_4,
+    predict_dn_f_mg_l_tree_5,
+    predict_dn_f_mg_l_tree_6,
+    predict_dn_f_mg_l_tree_7,
+};
+
+float predict_dn_f_mg_l(const float input_raw[FISH_N_FEATURES]) {
+    long sum_q = 0;
+    for (int i = 0; i < PREDICT_DN_F_MG_L_N_TREES; i++) {
+        sum_q += fish_eval_q_tree_le(predict_dn_f_mg_l_trees[i], input_raw);
+    }
+    float avg_q = (float)sum_q / (float)PREDICT_DN_F_MG_L_N_TREES;
+    float pred = predict_dn_f_mg_l_y_min + (avg_q * predict_dn_f_mg_l_y_step);
+    if (pred < 0.0f) pred = 0.0f;
+    return pred;
+}
+
+
+#endif
