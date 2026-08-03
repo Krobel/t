@@ -1,0 +1,50 @@
+# Model export
+
+This folder contains the Python-to-C/C++ export stage used to convert trained soft-sensor models into Arduino-compatible header files.
+
+## Included files
+
+- `export_biofloc_models_to_c.py`: cleaned standalone biofloc export script. It trains candidate models, selects the best exportable model by cross-validated R2, retrains the selected model on all available target-specific rows, and writes one combined `biofloc_compact_models.h` header.
+- `verify_header_metadata.py`: checks basic metadata in the generated C/C++ model headers.
+- `export_sklearn_tree_template.py`: general template for future model-export extensions.
+
+## Biofloc export input order
+
+The generated biofloc header expects this feature order:
+
+```text
+input_raw[0] = DO_B(mg/L)
+input_raw[1] = ORP_B(mV)
+input_raw[2] = EC_B(mS/cm)
+input_raw[3] = pH_B
+input_raw[4] = Temp_B(C)
+input_raw[5] = Turbidty_B(NTU)
+```
+
+## Example use
+
+From the repository root:
+
+```bash
+python model_export/export_biofloc_models_to_c.py \
+  --input-excel "split tank full data.xlsx" \
+  --sheet-name "Biofloc tank" \
+  --output-dir "exports/biofloc_c_models"
+```
+
+The main generated deployment file will be:
+
+```text
+exports/biofloc_c_models/biofloc_compact_models.h
+```
+
+Copy that header into:
+
+```text
+firmware/biofloc_node_with_TinyML/
+embedded_models/
+```
+
+## Notes
+
+The current clean export script is for the biofloc reactor. The fish-tank embedded header is included in `embedded_models/`, but the original fish-tank conversion script was not provided in this repository version. Add it here as `export_fish_models_to_c.py` when available.
