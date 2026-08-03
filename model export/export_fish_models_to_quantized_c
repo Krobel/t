@@ -1,0 +1,1417 @@
+"""
+Fish-tank model export workflow.
+
+This script trains the deployment candidates for the fish-tank soft sensors and
+exports a compact, pruned, int16-quantized C/C++ header for Arduino deployment.
+The generated header is intended to be included by the fish-node TinyML firmware.
+
+Expected feature order in the generated header:
+    input_raw[0] = DO_F(mg/L)
+    input_raw[1] = ORP_F(mV)
+    input_raw[2] = EC_F(mS/cm)
+    input_raw[3] = pH_F
+    input_raw[4] = Temp_F(C)
+"""
+
+
+import os
+import re
+import json
+import shutil
+import argparse
+import numpy as np
+import pandas as pd
+
+from sklearn.linear_model import LinearRegression
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.ensemble import RandomForestRegressor, AdaBoostRegressor
+from sklearn.model_selection import KFold, LeaveOneOut
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.base import clone
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+from xgboost import XGBRegressor
+
+
+
+# ============================================================
+# 1. USER SETTINGS
+# ============================================================
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Train fish-tank soft-sensor models and export a compact quantized C/C++ header."
+    )
+    parser.add_argument(
+        "--input-excel",
+        required=True,
+        help="Path to the Excel workbook containing the fish-tank data."
+    )
+    parser.add_argument(
+        "--sheet-name",
+        default="Fish tank",
+        help="Excel sheet name to load. Default: Fish tank."
+    )
+    parser.add_argument(
+        "--output-dir",
+        default="exports/fish_c_models_micro_quantized",
+        help="Directory where the generated header and summary CSV files will be written."
+    )
+    parser.add_argument(
+        "--header-name",
+        default="fish_compact_models.h",
+        help="Name of the combined Arduino C/C++ header file."
+    )
+    parser.add_argument(
+        "--keep-old-exports",
+        action="store_true",
+        help="Keep existing files in the output directory instead of clearing it first."
+    )
+    return parser.parse_args()
+
+
+args = parse_args()
+
+file_path = args.input_excel
+sheet_name = args.sheet_name
+
+EXPORT_DIR = args.output_dir
+COMBINED_HEADER_NAME = args.header_name
+
+CLEAR_OLD_EXPORTS = not args.keep_old_exports
+
+# Fish tank, no turbidity, no EC.
+# Arduino input order must match this exactly.
+features_fish = [
+    "DO_F(mg/L)",
+    "ORP_F(mV)",
+    "pH_F",
+    "Temp_F(C)",
+]
+
+targets_fish = [
+    "TAN_F(mg/L)",
+    "TOC_F(mg/L)",
+    "DOC_F(mg/L)",
+    "TN_F(mg/L)",
+    "DN_F(mg/L)",
+]
+
+# Keep all model families, but deploy only micro/pruned versions.
+EXPORTABLE_MODELS = {
+    "LinearRegression",
+    "DecisionTree",
+    "KNN_k3",
+    "RandomForest",
+    "AdaBoost",
+    "XGBoost",
+}
+
+
+# ============================================================
+# 2. CLEAN EXPORT FOLDER
+# ============================================================
+
+if CLEAR_OLD_EXPORTS:
+    if os.path.exists(EXPORT_DIR):
+        shutil.rmtree(EXPORT_DIR)
+
+os.makedirs(EXPORT_DIR, exist_ok=True)
+
+print("Clean export folder:")
+print(EXPORT_DIR)
+
+
+# ============================================================
+# 3. LOAD DATA
+# ============================================================
+
+fish_df = pd.read_excel(file_path, sheet_name=sheet_name)
+
+print("\nLoaded data:")
+print(fish_df.shape)
+
+print("\nAvailable columns:")
+print(list(fish_df.columns))
+
+missing_features = [col for col in features_fish if col not in fish_df.columns]
+missing_targets = [col for col in targets_fish if col not in fish_df.columns]
+
+if missing_features:
+    raise ValueError(f"Missing feature columns: {missing_features}")
+
+if missing_targets:
+    raise ValueError(f"Missing target columns: {missing_targets}")
+
+
+# ============================================================
+# 4. MICRO-ENSEMBLE MODEL DEFINITIONS
+# ============================================================
+
+def make_small_adaboost():
+    base_tree = DecisionTreeRegressor(
+        max_depth=2,
+        min_samples_leaf=8,
+        random_state=42
+    )
+
+    # sklearn changed base_estimator -> estimator in newer versions.
+    try:
+        return AdaBoostRegressor(
+            estimator=base_tree,
+            n_estimators=10,
+            learning_rate=0.05,
+            random_state=42
+        )
+    except TypeError:
+        return AdaBoostRegressor(
+            base_estimator=base_tree,
+            n_estimators=10,
+            learning_rate=0.05,
+            random_state=42
+        )
+
+
+def get_candidate_models():
+    models = {
+        "LinearRegression": Pipeline([
+            ("scaler", StandardScaler()),
+            ("model", LinearRegression())
+        ]),
+
+        # Single pruned tree
+        "DecisionTree": DecisionTreeRegressor(
+            max_depth=4,
+            min_samples_leaf=8,
+            random_state=42
+        ),
+
+        # Small KNN
+        "KNN_k3": Pipeline([
+            ("scaler", StandardScaler()),
+            ("knn", KNeighborsRegressor(n_neighbors=3))
+        ]),
+
+        # Micro Random Forest
+        "RandomForest": RandomForestRegressor(
+            n_estimators=8,
+            max_depth=3,
+            min_samples_leaf=8,
+            max_features=0.75,
+            random_state=42,
+            n_jobs=-1
+        ),
+
+        # Micro AdaBoost
+        "AdaBoost": make_small_adaboost(),
+
+        # Micro XGBoost
+        "XGBoost": XGBRegressor(
+            n_estimators=12,
+            max_depth=2,
+            learning_rate=0.05,
+            min_child_weight=8,
+            gamma=0.05,
+            reg_lambda=10.0,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            objective="reg:squarederror",
+            random_state=42,
+            n_jobs=-1,
+            verbosity=0
+        ),
+    }
+
+    return models
+
+
+# ============================================================
+# 5. CROSS-VALIDATION
+# ============================================================
+
+def cv_predictions_for_model(model, X, y, n_splits=10, random_state=42):
+    n_samples = len(y)
+    effective_splits = min(n_splits, n_samples)
+
+    if effective_splits < 2:
+        raise ValueError("At least 2 samples are required for cross-validation.")
+
+    kf = KFold(
+        n_splits=effective_splits,
+        shuffle=True,
+        random_state=random_state
+    )
+
+    y_true_all = np.array(y, copy=True, dtype=float)
+    y_pred_all = np.zeros_like(y_true_all, dtype=float)
+
+    for train_idx, test_idx in kf.split(X):
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_train = y[train_idx]
+
+        m = clone(model)
+        m.fit(X_train, y_train)
+
+        y_pred = m.predict(X_test)
+        y_pred_all[test_idx] = y_pred
+
+    mae = mean_absolute_error(y_true_all, y_pred_all)
+    rmse = np.sqrt(mean_squared_error(y_true_all, y_pred_all))
+    r2 = r2_score(y_true_all, y_pred_all)
+
+    return mae, rmse, r2, y_true_all, y_pred_all
+
+
+def cv_metrics_for_models(models, X, y, n_splits=10, random_state=42):
+    results = {}
+
+    for name, model in models.items():
+        try:
+            mae, rmse, r2, _, _ = cv_predictions_for_model(
+                model,
+                X,
+                y,
+                n_splits=n_splits,
+                random_state=random_state
+            )
+
+            results[name] = {
+                "mae": mae,
+                "rmse": rmse,
+                "r2": r2,
+                "failed": False,
+                "error": ""
+            }
+
+        except Exception as e:
+            results[name] = {
+                "mae": np.nan,
+                "rmse": np.nan,
+                "r2": -np.inf,
+                "failed": True,
+                "error": str(e)
+            }
+
+    return results
+
+
+def loo_evaluation(model, X, y):
+    if len(y) < 2:
+        raise ValueError("At least 2 samples are required for leave-one-out evaluation.")
+
+    loo = LeaveOneOut()
+
+    y_true_all = []
+    y_pred_all = []
+
+    for train_idx, test_idx in loo.split(X):
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_train, y_test = y[train_idx], y[test_idx]
+
+        m = clone(model)
+        m.fit(X_train, y_train)
+
+        y_pred = m.predict(X_test)
+
+        y_true_all.append(float(y_test[0]))
+        y_pred_all.append(float(y_pred[0]))
+
+    y_true_all = np.array(y_true_all)
+    y_pred_all = np.array(y_pred_all)
+
+    mae = mean_absolute_error(y_true_all, y_pred_all)
+    rmse = np.sqrt(mean_squared_error(y_true_all, y_pred_all))
+    r2 = r2_score(y_true_all, y_pred_all)
+
+    return mae, rmse, r2, y_true_all, y_pred_all
+
+
+# ============================================================
+# 6. NAMING AND C FORMAT HELPERS
+# ============================================================
+
+def make_c_name(name):
+    name = str(name)
+    name = re.sub(r"[^0-9a-zA-Z]+", "_", name)
+    name = name.strip("_")
+
+    if not re.match(r"^[A-Za-z_]", name):
+        name = "x_" + name
+
+    return name.lower()
+
+
+def c_float(x):
+    x = float(x)
+
+    if np.isnan(x):
+        return "0.0f"
+
+    if np.isposinf(x):
+        return "3.4028235e38f"
+
+    if np.isneginf(x):
+        return "-3.4028235e38f"
+
+    s = f"{x:.9g}"
+
+    if "." not in s and "e" not in s.lower():
+        s += ".0"
+
+    return s + "f"
+
+
+def c_float_array(values):
+    return ", ".join(c_float(v) for v in values)
+
+
+def c_int_array(values):
+    return ", ".join(str(int(v)) for v in values)
+
+
+def get_estimator_and_scaler(fitted_model):
+    scaler = None
+    estimator = fitted_model
+
+    if isinstance(fitted_model, Pipeline):
+        for step_name, step_obj in fitted_model.steps:
+            if isinstance(step_obj, StandardScaler):
+                scaler = step_obj
+
+        estimator = fitted_model.steps[-1][1]
+
+    return estimator, scaler
+
+
+# ============================================================
+# 7. QUANTIZATION HELPERS
+# ============================================================
+
+def make_feature_quant_params(X):
+    feature_min = X.min(axis=0)
+    feature_max = X.max(axis=0)
+
+    feature_step = (feature_max - feature_min) / 32767.0
+    feature_step = np.where(feature_step == 0.0, 1.0, feature_step)
+
+    return feature_min.astype(float), feature_step.astype(float)
+
+
+def quantize_feature_value(x, f, feature_min, feature_step):
+    q = int(round((float(x) - float(feature_min[f])) / float(feature_step[f])))
+
+    if q < 0:
+        q = 0
+
+    if q > 32767:
+        q = 32767
+
+    return q
+
+
+def quantize_target_values(y):
+    y = np.asarray(y, dtype=float)
+
+    y_min = float(np.min(y))
+    y_max = float(np.max(y))
+
+    y_step = (y_max - y_min) / 32767.0
+
+    if y_step == 0.0:
+        y_step = 1.0
+
+    y_q = np.round((y - y_min) / y_step).astype(int)
+    y_q = np.clip(y_q, 0, 32767).astype(np.int16)
+
+    return y_min, y_step, y_q
+
+
+def quantize_target_scalar(y_value, y_min, y_step):
+    q = int(round((float(y_value) - float(y_min)) / float(y_step)))
+
+    if q < 0:
+        q = 0
+
+    if q > 32767:
+        q = 32767
+
+    return q
+
+
+def quantize_signed_scaled_array(X_scaled, multiplier=1000.0):
+    Xq = np.round(X_scaled * multiplier).astype(int)
+    Xq = np.clip(Xq, -32768, 32767).astype(np.int16)
+    return Xq
+
+
+# ============================================================
+# 8. SKLEARN TREE EXTRACTION, QUANTIZED
+# ============================================================
+
+def sklearn_tree_to_quantized_nodes(tree_estimator, feature_min, feature_step, y_min, y_step):
+    tree = tree_estimator.tree_
+
+    children_left = tree.children_left
+    children_right = tree.children_right
+    feature = tree.feature
+    threshold = tree.threshold
+    value = tree.value.reshape(tree.value.shape[0], -1)[:, 0]
+
+    nodes = []
+
+    for i in range(tree.node_count):
+        if children_left[i] == children_right[i]:
+            nodes.append({
+                "feature": -1,
+                "threshold_q": 0,
+                "left": -1,
+                "right": -1,
+                "value_q": quantize_target_scalar(value[i], y_min, y_step),
+            })
+        else:
+            f = int(feature[i])
+
+            nodes.append({
+                "feature": f,
+                "threshold_q": quantize_feature_value(
+                    threshold[i],
+                    f,
+                    feature_min,
+                    feature_step
+                ),
+                "left": int(children_left[i]),
+                "right": int(children_right[i]),
+                "value_q": 0,
+            })
+
+    return nodes
+
+
+# ============================================================
+# 9. XGBOOST TREE EXTRACTION, QUANTIZED
+# ============================================================
+
+def parse_xgb_base_score(xgb_model):
+    booster = xgb_model.get_booster()
+    config = json.loads(booster.save_config())
+
+    raw = config["learner"]["learner_model_param"].get("base_score", "0")
+
+    if isinstance(raw, str):
+        raw = raw.strip()
+
+        if raw.startswith("[") and raw.endswith("]"):
+            raw = raw[1:-1]
+
+    return float(raw)
+
+
+def xgb_feature_index(split_name):
+    split_name = str(split_name)
+
+    if split_name.startswith("f"):
+        return int(split_name[1:])
+
+    raise ValueError(f"Unexpected XGBoost split name: {split_name}")
+
+
+def xgb_json_tree_to_float_nodes(tree_dict):
+    nodes = []
+
+    def build(node):
+        idx = len(nodes)
+
+        nodes.append({
+            "feature": -1,
+            "threshold": 0.0,
+            "left": -1,
+            "right": -1,
+            "value": 0.0,
+        })
+
+        if "leaf" in node:
+            nodes[idx] = {
+                "feature": -1,
+                "threshold": 0.0,
+                "left": -1,
+                "right": -1,
+                "value": float(node["leaf"]),
+            }
+            return idx
+
+        children = {child["nodeid"]: child for child in node["children"]}
+
+        yes_id = node["yes"]
+        no_id = node["no"]
+
+        left_idx = build(children[yes_id])
+        right_idx = build(children[no_id])
+
+        nodes[idx] = {
+            "feature": xgb_feature_index(node["split"]),
+            "threshold": float(node["split_condition"]),
+            "left": left_idx,
+            "right": right_idx,
+            "value": 0.0,
+        }
+
+        return idx
+
+    build(tree_dict)
+
+    return nodes
+
+
+def xgb_float_nodes_to_quantized_leaf_delta_nodes(nodes, feature_min, feature_step, leaf_min, leaf_step):
+    qnodes = []
+
+    for n in nodes:
+        if n["feature"] < 0:
+            qnodes.append({
+                "feature": -1,
+                "threshold_q": 0,
+                "left": -1,
+                "right": -1,
+                "value_q": quantize_target_scalar(n["value"], leaf_min, leaf_step),
+            })
+        else:
+            f = int(n["feature"])
+
+            qnodes.append({
+                "feature": f,
+                "threshold_q": quantize_feature_value(
+                    n["threshold"],
+                    f,
+                    feature_min,
+                    feature_step
+                ),
+                "left": int(n["left"]),
+                "right": int(n["right"]),
+                "value_q": 0,
+            })
+
+    return qnodes
+
+
+def collect_xgb_leaf_values(float_trees):
+    vals = []
+
+    for nodes in float_trees:
+        for n in nodes:
+            if n["feature"] < 0:
+                vals.append(float(n["value"]))
+
+    if len(vals) == 0:
+        vals = [0.0]
+
+    return np.array(vals, dtype=float)
+
+
+# ============================================================
+# 10. C HEADER WRITERS
+# ============================================================
+
+def write_quant_tree_nodes(lines, array_name, nodes):
+    lines.append(f"static const FishQTreeNode {array_name}[] = {{")
+
+    for n in nodes:
+        lines.append(
+            "    {"
+            + f"{int(n['feature'])}, "
+            + f"{int(n['threshold_q'])}, "
+            + f"{int(n['left'])}, "
+            + f"{int(n['right'])}, "
+            + f"{int(n['value_q'])}"
+            + "},"
+        )
+
+    lines.append("};")
+    lines.append("")
+
+
+def add_linear_model(lines, res):
+    final_model = res["final_model"]
+    target = res["target"]
+
+    fn = f"predict_{make_c_name(target)}"
+    prefix = fn
+
+    estimator, scaler = get_estimator_and_scaler(final_model)
+
+    if scaler is None:
+        raise ValueError("LinearRegression export expects StandardScaler.")
+
+    mean = scaler.mean_.astype(float)
+    scale = scaler.scale_.astype(float)
+    coef = estimator.coef_.astype(float)
+    intercept = float(estimator.intercept_)
+
+    lines.append(f"/* LinearRegression for {target} */")
+    lines.append(f"static const float {prefix}_mean[FISH_N_FEATURES] = {{{c_float_array(mean)}}};")
+    lines.append(f"static const float {prefix}_scale[FISH_N_FEATURES] = {{{c_float_array(scale)}}};")
+    lines.append(f"static const float {prefix}_coef[FISH_N_FEATURES] = {{{c_float_array(coef)}}};")
+    lines.append(f"static const float {prefix}_intercept = {c_float(intercept)};")
+    lines.append("")
+    lines.append(f"float {fn}(const float input_raw[FISH_N_FEATURES]) {{")
+    lines.append(f"    float pred = {prefix}_intercept;")
+    lines.append("    for (int i = 0; i < FISH_N_FEATURES; i++) {")
+    lines.append(f"        float xs = (input_raw[i] - {prefix}_mean[i]) / {prefix}_scale[i];")
+    lines.append(f"        pred += {prefix}_coef[i] * xs;")
+    lines.append("    }")
+    lines.append("    if (pred < 0.0f) pred = 0.0f;")
+    lines.append("    return pred;")
+    lines.append("}")
+    lines.append("")
+
+
+def add_quant_knn_model(lines, res, multiplier=1000.0):
+    final_model = res["final_model"]
+    target = res["target"]
+    X_train_raw = res["X_train_final"]
+    y_train = res["y_train_final"]
+
+    fn = f"predict_{make_c_name(target)}"
+    prefix = fn
+
+    estimator, scaler = get_estimator_and_scaler(final_model)
+
+    if scaler is None:
+        raise ValueError("Quantized KNN export expects StandardScaler.")
+
+    X_scaled = scaler.transform(X_train_raw).astype(float)
+    Xq = quantize_signed_scaled_array(X_scaled, multiplier=multiplier)
+
+    y_min, y_step, yq = quantize_target_values(y_train)
+
+    k = int(estimator.n_neighbors)
+    n_samples, n_features = Xq.shape
+
+    lines.append(f"/* Quantized KNN_k{k} for {target} */")
+    lines.append(f"#define {prefix.upper()}_N_SAMPLES {n_samples}")
+    lines.append(f"#define {prefix.upper()}_K {k}")
+    lines.append(f"static const float {prefix}_mean[FISH_N_FEATURES] = {{{c_float_array(scaler.mean_)}}};")
+    lines.append(f"static const float {prefix}_scale[FISH_N_FEATURES] = {{{c_float_array(scaler.scale_)}}};")
+    lines.append(f"static const float {prefix}_q_multiplier = {c_float(multiplier)};")
+    lines.append(f"static const float {prefix}_y_min = {c_float(y_min)};")
+    lines.append(f"static const float {prefix}_y_step = {c_float(y_step)};")
+    lines.append("")
+    lines.append(f"static const int16_t {prefix}_xq[{prefix.upper()}_N_SAMPLES][FISH_N_FEATURES] = {{")
+
+    for row in Xq:
+        lines.append("    {" + c_int_array(row) + "},")
+
+    lines.append("};")
+    lines.append("")
+    lines.append(f"static const int16_t {prefix}_yq[{prefix.upper()}_N_SAMPLES] = {{{c_int_array(yq)}}};")
+    lines.append("")
+    lines.append(f"float {fn}(const float input_raw[FISH_N_FEATURES]) {{")
+    lines.append("    int16_t input_q[FISH_N_FEATURES];")
+    lines.append("    for (int j = 0; j < FISH_N_FEATURES; j++) {")
+    lines.append(f"        float z = (input_raw[j] - {prefix}_mean[j]) / {prefix}_scale[j];")
+    lines.append(f"        float qf = z * {prefix}_q_multiplier;")
+    lines.append("        if (qf > 32767.0f) qf = 32767.0f;")
+    lines.append("        if (qf < -32768.0f) qf = -32768.0f;")
+    lines.append("        if (qf >= 0.0f) input_q[j] = (int16_t)(qf + 0.5f);")
+    lines.append("        else input_q[j] = (int16_t)(qf - 0.5f);")
+    lines.append("    }")
+    lines.append("")
+    lines.append(f"    long long best_dist[{prefix.upper()}_K];")
+    lines.append(f"    int16_t best_yq[{prefix.upper()}_K];")
+    lines.append(f"    for (int k = 0; k < {prefix.upper()}_K; k++) {{")
+    lines.append("        best_dist[k] = 9223372036854775807LL;")
+    lines.append("        best_yq[k] = 0;")
+    lines.append("    }")
+    lines.append("")
+    lines.append(f"    for (int i = 0; i < {prefix.upper()}_N_SAMPLES; i++) {{")
+    lines.append("        long long dist = 0;")
+    lines.append("        for (int j = 0; j < FISH_N_FEATURES; j++) {")
+    lines.append(f"            long long diff = (long long)input_q[j] - (long long){prefix}_xq[i][j];")
+    lines.append("            dist += diff * diff;")
+    lines.append("        }")
+    lines.append("        int worst_index = 0;")
+    lines.append("        long long worst_dist = best_dist[0];")
+    lines.append(f"        for (int k = 1; k < {prefix.upper()}_K; k++) {{")
+    lines.append("            if (best_dist[k] > worst_dist) {")
+    lines.append("                worst_dist = best_dist[k];")
+    lines.append("                worst_index = k;")
+    lines.append("            }")
+    lines.append("        }")
+    lines.append("        if (dist < worst_dist) {")
+    lines.append("            best_dist[worst_index] = dist;")
+    lines.append(f"            best_yq[worst_index] = {prefix}_yq[i];")
+    lines.append("        }")
+    lines.append("    }")
+    lines.append("")
+    lines.append("    long sum_q = 0;")
+    lines.append(f"    for (int k = 0; k < {prefix.upper()}_K; k++) sum_q += best_yq[k];")
+    lines.append(f"    float avg_q = (float)sum_q / (float){prefix.upper()}_K;")
+    lines.append(f"    float pred = {prefix}_y_min + (avg_q * {prefix}_y_step);")
+    lines.append("    if (pred < 0.0f) pred = 0.0f;")
+    lines.append("    return pred;")
+    lines.append("}")
+    lines.append("")
+
+
+def add_quant_decision_tree_model(lines, res, feature_min, feature_step):
+    target = res["target"]
+    final_model = res["final_model"]
+    y_train = res["y_train_final"]
+
+    fn = f"predict_{make_c_name(target)}"
+    prefix = fn
+
+    estimator, scaler = get_estimator_and_scaler(final_model)
+
+    if scaler is not None:
+        raise ValueError("DecisionTree export does not expect scaler.")
+
+    y_min, y_step, _ = quantize_target_values(y_train)
+
+    nodes = sklearn_tree_to_quantized_nodes(
+        estimator,
+        feature_min,
+        feature_step,
+        y_min,
+        y_step
+    )
+
+    lines.append(f"/* Quantized pruned DecisionTree for {target} */")
+    lines.append(f"static const float {prefix}_y_min = {c_float(y_min)};")
+    lines.append(f"static const float {prefix}_y_step = {c_float(y_step)};")
+    write_quant_tree_nodes(lines, f"{prefix}_tree", nodes)
+
+    lines.append(f"float {fn}(const float input_raw[FISH_N_FEATURES]) {{")
+    lines.append(f"    int16_t yq = fish_eval_q_tree_le({prefix}_tree, input_raw);")
+    lines.append(f"    float pred = {prefix}_y_min + ((float)yq * {prefix}_y_step);")
+    lines.append("    if (pred < 0.0f) pred = 0.0f;")
+    lines.append("    return pred;")
+    lines.append("}")
+    lines.append("")
+
+
+def add_quant_random_forest_model(lines, res, feature_min, feature_step):
+    target = res["target"]
+    final_model = res["final_model"]
+    y_train = res["y_train_final"]
+
+    fn = f"predict_{make_c_name(target)}"
+    prefix = fn
+
+    estimator, scaler = get_estimator_and_scaler(final_model)
+
+    if scaler is not None:
+        raise ValueError("RandomForest export does not expect scaler.")
+
+    y_min, y_step, _ = quantize_target_values(y_train)
+
+    trees = [
+        sklearn_tree_to_quantized_nodes(t, feature_min, feature_step, y_min, y_step)
+        for t in estimator.estimators_
+    ]
+
+    n_trees = len(trees)
+
+    lines.append(f"/* Quantized micro RandomForest for {target} */")
+    lines.append(f"#define {prefix.upper()}_N_TREES {n_trees}")
+    lines.append(f"static const float {prefix}_y_min = {c_float(y_min)};")
+    lines.append(f"static const float {prefix}_y_step = {c_float(y_step)};")
+    lines.append("")
+
+    for i, nodes in enumerate(trees):
+        write_quant_tree_nodes(lines, f"{prefix}_tree_{i}", nodes)
+
+    lines.append(f"static const FishQTreeNode* const {prefix}_trees[{prefix.upper()}_N_TREES] = {{")
+
+    for i in range(n_trees):
+        lines.append(f"    {prefix}_tree_{i},")
+
+    lines.append("};")
+    lines.append("")
+    lines.append(f"float {fn}(const float input_raw[FISH_N_FEATURES]) {{")
+    lines.append("    long sum_q = 0;")
+    lines.append(f"    for (int i = 0; i < {prefix.upper()}_N_TREES; i++) {{")
+    lines.append(f"        sum_q += fish_eval_q_tree_le({prefix}_trees[i], input_raw);")
+    lines.append("    }")
+    lines.append(f"    float avg_q = (float)sum_q / (float){prefix.upper()}_N_TREES;")
+    lines.append(f"    float pred = {prefix}_y_min + (avg_q * {prefix}_y_step);")
+    lines.append("    if (pred < 0.0f) pred = 0.0f;")
+    lines.append("    return pred;")
+    lines.append("}")
+    lines.append("")
+
+
+def add_quant_adaboost_model(lines, res, feature_min, feature_step):
+    target = res["target"]
+    final_model = res["final_model"]
+    y_train = res["y_train_final"]
+
+    fn = f"predict_{make_c_name(target)}"
+    prefix = fn
+
+    estimator, scaler = get_estimator_and_scaler(final_model)
+
+    if scaler is not None:
+        raise ValueError("AdaBoost export does not expect scaler.")
+
+    y_min, y_step, _ = quantize_target_values(y_train)
+
+    trees = [
+        sklearn_tree_to_quantized_nodes(t, feature_min, feature_step, y_min, y_step)
+        for t in estimator.estimators_
+    ]
+
+    weights = estimator.estimator_weights_.astype(float)
+
+    n_trees = len(trees)
+
+    lines.append(f"/* Quantized micro AdaBoostRegressor for {target} */")
+    lines.append(f"#define {prefix.upper()}_N_TREES {n_trees}")
+    lines.append(f"static const float {prefix}_y_min = {c_float(y_min)};")
+    lines.append(f"static const float {prefix}_y_step = {c_float(y_step)};")
+    lines.append(f"static const float {prefix}_weights[{prefix.upper()}_N_TREES] = {{{c_float_array(weights)}}};")
+    lines.append("")
+
+    for i, nodes in enumerate(trees):
+        write_quant_tree_nodes(lines, f"{prefix}_tree_{i}", nodes)
+
+    lines.append(f"static const FishQTreeNode* const {prefix}_trees[{prefix.upper()}_N_TREES] = {{")
+
+    for i in range(n_trees):
+        lines.append(f"    {prefix}_tree_{i},")
+
+    lines.append("};")
+    lines.append("")
+    lines.append(f"float {fn}(const float input_raw[FISH_N_FEATURES]) {{")
+    lines.append(f"    int16_t preds[{prefix.upper()}_N_TREES];")
+    lines.append(f"    float weights[{prefix.upper()}_N_TREES];")
+    lines.append(f"    for (int i = 0; i < {prefix.upper()}_N_TREES; i++) {{")
+    lines.append(f"        preds[i] = fish_eval_q_tree_le({prefix}_trees[i], input_raw);")
+    lines.append(f"        weights[i] = {prefix}_weights[i];")
+    lines.append("    }")
+    lines.append("")
+    lines.append(f"    for (int i = 1; i < {prefix.upper()}_N_TREES; i++) {{")
+    lines.append("        int16_t p = preds[i];")
+    lines.append("        float w = weights[i];")
+    lines.append("        int j = i - 1;")
+    lines.append("        while (j >= 0 && preds[j] > p) {")
+    lines.append("            preds[j + 1] = preds[j];")
+    lines.append("            weights[j + 1] = weights[j];")
+    lines.append("            j--;")
+    lines.append("        }")
+    lines.append("        preds[j + 1] = p;")
+    lines.append("        weights[j + 1] = w;")
+    lines.append("    }")
+    lines.append("")
+    lines.append("    float total_weight = 0.0f;")
+    lines.append(f"    for (int i = 0; i < {prefix.upper()}_N_TREES; i++) total_weight += weights[i];")
+    lines.append("    float threshold = 0.5f * total_weight;")
+    lines.append("    float cumulative = 0.0f;")
+    lines.append("    int16_t pred_q = preds[0];")
+    lines.append(f"    for (int i = 0; i < {prefix.upper()}_N_TREES; i++) {{")
+    lines.append("        cumulative += weights[i];")
+    lines.append("        if (cumulative >= threshold) {")
+    lines.append("            pred_q = preds[i];")
+    lines.append("            break;")
+    lines.append("        }")
+    lines.append("    }")
+    lines.append(f"    float pred = {prefix}_y_min + ((float)pred_q * {prefix}_y_step);")
+    lines.append("    if (pred < 0.0f) pred = 0.0f;")
+    lines.append("    return pred;")
+    lines.append("}")
+    lines.append("")
+
+
+def add_quant_xgboost_model(lines, res, feature_min, feature_step):
+    target = res["target"]
+    final_model = res["final_model"]
+
+    fn = f"predict_{make_c_name(target)}"
+    prefix = fn
+
+    estimator, scaler = get_estimator_and_scaler(final_model)
+
+    if scaler is not None:
+        raise ValueError("XGBoost export does not expect scaler.")
+
+    booster = estimator.get_booster()
+    dumps = booster.get_dump(dump_format="json")
+
+    float_trees = [xgb_json_tree_to_float_nodes(json.loads(d)) for d in dumps]
+
+    leaf_values = collect_xgb_leaf_values(float_trees)
+    leaf_min, leaf_step, _ = quantize_target_values(leaf_values)
+
+    qtrees = [
+        xgb_float_nodes_to_quantized_leaf_delta_nodes(
+            nodes,
+            feature_min,
+            feature_step,
+            leaf_min,
+            leaf_step
+        )
+        for nodes in float_trees
+    ]
+
+    n_trees = len(qtrees)
+
+    base_score = parse_xgb_base_score(estimator)
+
+    lines.append(f"/* Quantized micro XGBoost for {target} */")
+    lines.append(f"#define {prefix.upper()}_N_TREES {n_trees}")
+    lines.append(f"static const float {prefix}_base_score = {c_float(base_score)};")
+    lines.append(f"static const float {prefix}_leaf_min = {c_float(leaf_min)};")
+    lines.append(f"static const float {prefix}_leaf_step = {c_float(leaf_step)};")
+    lines.append("")
+
+    for i, nodes in enumerate(qtrees):
+        write_quant_tree_nodes(lines, f"{prefix}_tree_{i}", nodes)
+
+    lines.append(f"static const FishQTreeNode* const {prefix}_trees[{prefix.upper()}_N_TREES] = {{")
+
+    for i in range(n_trees):
+        lines.append(f"    {prefix}_tree_{i},")
+
+    lines.append("};")
+    lines.append("")
+    lines.append(f"float {fn}(const float input_raw[FISH_N_FEATURES]) {{")
+    lines.append(f"    float pred = {prefix}_base_score;")
+    lines.append(f"    for (int i = 0; i < {prefix.upper()}_N_TREES; i++) {{")
+    lines.append(f"        int16_t leaf_q = fish_eval_q_tree_lt({prefix}_trees[i], input_raw);")
+    lines.append(f"        pred += {prefix}_leaf_min + ((float)leaf_q * {prefix}_leaf_step);")
+    lines.append("    }")
+    lines.append("    if (pred < 0.0f) pred = 0.0f;")
+    lines.append("    return pred;")
+    lines.append("}")
+    lines.append("")
+
+
+# ============================================================
+# 11. HEADER GENERATOR
+# ============================================================
+
+def add_header_preamble(lines, feature_min, feature_step):
+    lines.append("#ifndef FISH_COMPACT_MODELS_H")
+    lines.append("#define FISH_COMPACT_MODELS_H")
+    lines.append("")
+    lines.append("#include <stdint.h>")
+    lines.append("#include <math.h>")
+    lines.append("")
+    lines.append("/*")
+    lines.append("Compact pruned + quantized embedded models for fish-tank data.")
+    lines.append("Generated from Colab.")
+    lines.append("")
+    lines.append("Input order:")
+    lines.append("input_raw[0] = DO_F(mg/L)")
+    lines.append("input_raw[1] = ORP_F(mV)")
+    lines.append("input_raw[2] = pH_F")
+    lines.append("input_raw[3] = Temp_F(C)")
+    lines.append("")
+    lines.append("Targets:")
+    lines.append("TAN_F(mg/L)")
+    lines.append("TOC_F(mg/L)")
+    lines.append("DOC_F(mg/L)")
+    lines.append("TN_F(mg/L)")
+    lines.append("DN_F(mg/L)")
+    lines.append("")
+    lines.append("Deployment optimization:")
+    lines.append("- Micro RandomForest, AdaBoost, and XGBoost")
+    lines.append("- Shallow tree depth")
+    lines.append("- Increased minimum leaf size")
+    lines.append("- int16_t quantized tree thresholds")
+    lines.append("- int16_t quantized tree/KNN outputs")
+    lines.append("- int16_t quantized KNN feature matrix")
+    lines.append("*/")
+    lines.append("")
+    lines.append("#define FISH_N_FEATURES 4")
+    lines.append("")
+    lines.append(f"static const float fish_feature_min[FISH_N_FEATURES] = {{{c_float_array(feature_min)}}};")
+    lines.append(f"static const float fish_feature_step[FISH_N_FEATURES] = {{{c_float_array(feature_step)}}};")
+    lines.append("")
+    lines.append("typedef struct {")
+    lines.append("    int16_t feature;")
+    lines.append("    int16_t threshold_q;")
+    lines.append("    int16_t left;")
+    lines.append("    int16_t right;")
+    lines.append("    int16_t value_q;")
+    lines.append("} FishQTreeNode;")
+    lines.append("")
+    lines.append("static int16_t fish_quantize_feature(float x, int16_t f) {")
+    lines.append("    if (!isfinite(x)) return 0;")
+    lines.append("    float qf = (x - fish_feature_min[f]) / fish_feature_step[f];")
+    lines.append("    if (qf < 0.0f) qf = 0.0f;")
+    lines.append("    if (qf > 32767.0f) qf = 32767.0f;")
+    lines.append("    return (int16_t)(qf + 0.5f);")
+    lines.append("}")
+    lines.append("")
+    lines.append("static int16_t fish_eval_q_tree_le(const FishQTreeNode *nodes, const float *input) {")
+    lines.append("    int16_t node = 0;")
+    lines.append("    while (nodes[node].feature >= 0) {")
+    lines.append("        int16_t f = nodes[node].feature;")
+    lines.append("        int16_t xq = fish_quantize_feature(input[f], f);")
+    lines.append("        if (xq <= nodes[node].threshold_q) node = nodes[node].left;")
+    lines.append("        else node = nodes[node].right;")
+    lines.append("    }")
+    lines.append("    return nodes[node].value_q;")
+    lines.append("}")
+    lines.append("")
+    lines.append("static int16_t fish_eval_q_tree_lt(const FishQTreeNode *nodes, const float *input) {")
+    lines.append("    int16_t node = 0;")
+    lines.append("    while (nodes[node].feature >= 0) {")
+    lines.append("        int16_t f = nodes[node].feature;")
+    lines.append("        int16_t xq = fish_quantize_feature(input[f], f);")
+    lines.append("        if (xq < nodes[node].threshold_q) node = nodes[node].left;")
+    lines.append("        else node = nodes[node].right;")
+    lines.append("    }")
+    lines.append("    return nodes[node].value_q;")
+    lines.append("}")
+    lines.append("")
+
+
+def create_combined_header(results, export_dir, header_name, feature_min, feature_step):
+    header_path = os.path.join(export_dir, header_name)
+
+    lines = []
+    add_header_preamble(lines, feature_min, feature_step)
+
+    for res in results:
+        model_name = res["best_model_name"]
+
+        lines.append("")
+        lines.append("/* ============================================================")
+        lines.append(f"   Target: {res['target']}")
+        lines.append(f"   Selected model: {model_name}")
+        lines.append("   ============================================================ */")
+        lines.append("")
+
+        if model_name == "LinearRegression":
+            add_linear_model(lines, res)
+
+        elif model_name == "KNN_k3":
+            add_quant_knn_model(lines, res)
+
+        elif model_name == "DecisionTree":
+            add_quant_decision_tree_model(lines, res, feature_min, feature_step)
+
+        elif model_name == "RandomForest":
+            add_quant_random_forest_model(lines, res, feature_min, feature_step)
+
+        elif model_name == "AdaBoost":
+            add_quant_adaboost_model(lines, res, feature_min, feature_step)
+
+        elif model_name == "XGBoost":
+            add_quant_xgboost_model(lines, res, feature_min, feature_step)
+
+        else:
+            raise ValueError(f"No deployment exporter for model: {model_name}")
+
+    lines.append("")
+    lines.append("#endif")
+    lines.append("")
+
+    with open(header_path, "w") as f:
+        f.write("\n".join(lines))
+
+    return header_path
+
+
+def validate_header(header_path):
+    with open(header_path, "r") as f:
+        text = f.read()
+
+    print("\nHeader validation:")
+    print("Header path:", header_path)
+    print("Number of #ifndef:", text.count("#ifndef"))
+    print("Number of #endif:", text.count("#endif"))
+
+    if text.count("#ifndef") != 1 or text.count("#endif") != 1:
+        raise ValueError("Header guard problem.")
+
+    bad_predict_guards = re.findall(r"#ifndef\s+PREDICT_[A-Z0-9_]+_H", text)
+    bad_float_literals = re.findall(r'(?<![A-Za-z0-9_.+\-])(-?\d+)f\b', text)
+
+    print("Bad nested PREDICT guards:", len(bad_predict_guards))
+    print("Bad float literals like 0f:", len(bad_float_literals))
+
+    if bad_predict_guards:
+        print("Examples:", bad_predict_guards[:10])
+        raise ValueError("Old nested PREDICT header guards found.")
+
+    if bad_float_literals:
+        print("Examples:", bad_float_literals[:10])
+        raise ValueError("Invalid float literals found.")
+
+    size_kb = os.path.getsize(header_path) / 1024.0
+    size_mb = size_kb / 1024.0
+
+    print(f"Header size: {size_kb:.1f} kB ({size_mb:.3f} MB)")
+    print(f"Header lines: {len(text.splitlines())}")
+    print("Header validation passed.")
+
+
+# ============================================================
+# 12. MODEL TRAINING AND SELECTION
+# ============================================================
+
+def select_best_model_by_r2(cv_metrics):
+    valid_models = {}
+
+    for name, vals in cv_metrics.items():
+        if name in EXPORTABLE_MODELS:
+            if not vals["failed"] and np.isfinite(vals["r2"]):
+                valid_models[name] = vals
+
+    if not valid_models:
+        raise ValueError("No valid exportable model was available.")
+
+    best_name = max(valid_models, key=lambda nm: valid_models[nm]["r2"])
+
+    return best_name
+
+
+def run_pipeline_target(df, feature_cols, target_col, n_splits=10):
+    sub_df = df[feature_cols + [target_col]].dropna()
+
+    if sub_df.empty:
+        raise ValueError(f"No valid rows found for target: {target_col}")
+
+    X = sub_df[feature_cols].values.astype(float)
+    y = sub_df[target_col].values.astype(float)
+
+    if len(y) < 2:
+        raise ValueError(f"Not enough samples for target: {target_col}")
+
+    models = get_candidate_models()
+
+    cv_metrics = cv_metrics_for_models(
+        models,
+        X,
+        y,
+        n_splits=n_splits,
+        random_state=42
+    )
+
+    print("\n" + "=" * 70)
+    print(f"Target: {target_col}")
+    print(f"Valid samples: {len(y)}")
+    print("=" * 70)
+
+    print("\n10-fold CV mean metrics:")
+    print("  Model            |  MAE   |  RMSE  |   R2")
+    print("  " + "-" * 55)
+
+    for name, m in sorted(cv_metrics.items(), key=lambda kv: kv[1]["r2"], reverse=True):
+        if m["failed"]:
+            print(f"  {name:16s} |   NA   |   NA   |   NA")
+            print(f"      Error: {m['error']}")
+        else:
+            print(
+                f"  {name:16s} | "
+                f"{m['mae']:6.3f} | "
+                f"{m['rmse']:6.3f} | "
+                f"{m['r2']:6.3f}"
+            )
+
+    best_name = select_best_model_by_r2(cv_metrics)
+    best_model = models[best_name]
+
+    print(f"\nSelected deployment model for {target_col}: {best_name}")
+
+    mae_cv_best, rmse_cv_best, r2_cv_best, y_true_cv, y_pred_cv = cv_predictions_for_model(
+        best_model,
+        X,
+        y,
+        n_splits=n_splits,
+        random_state=42
+    )
+
+    mae_loo, rmse_loo, r2_loo, y_true_loo, y_pred_loo = loo_evaluation(
+        best_model,
+        X,
+        y
+    )
+
+    print("\nSelected model 10-fold CV:")
+    print(f"  MAE  = {mae_cv_best:.3f}")
+    print(f"  RMSE = {rmse_cv_best:.3f}")
+    print(f"  R2   = {r2_cv_best:.3f}")
+
+    print("\nSelected model LOO:")
+    print(f"  MAE  = {mae_loo:.3f}")
+    print(f"  RMSE = {rmse_loo:.3f}")
+    print(f"  R2   = {r2_loo:.3f}")
+
+    final_model = clone(best_model)
+    final_model.fit(X, y)
+
+    return {
+        "target": target_col,
+        "n_samples": len(y),
+        "best_model_name": best_name,
+        "cv_metrics": cv_metrics,
+        "cv_best_mae": mae_cv_best,
+        "cv_best_rmse": rmse_cv_best,
+        "cv_best_r2": r2_cv_best,
+        "y_true_cv": y_true_cv,
+        "y_pred_cv": y_pred_cv,
+        "loo_mae": mae_loo,
+        "loo_rmse": rmse_loo,
+        "loo_r2": r2_loo,
+        "y_true_loo": y_true_loo,
+        "y_pred_loo": y_pred_loo,
+        "final_model": final_model,
+        "feature_cols": feature_cols,
+        "X_train_final": X,
+        "y_train_final": y,
+    }
+
+
+# ============================================================
+# 13. GLOBAL FEATURE QUANTIZATION
+# ============================================================
+
+feature_df = fish_df[features_fish].dropna()
+X_features_all = feature_df.values.astype(float)
+
+feature_min, feature_step = make_feature_quant_params(X_features_all)
+
+print("\nGlobal fish feature quantization:")
+for name, mn, st in zip(features_fish, feature_min, feature_step):
+    print(f"  {name}: min = {mn:.6f}, step = {st:.9f}")
+
+
+# ============================================================
+# 14. RUN ALL TARGETS
+# ============================================================
+
+results_fish = []
+
+for tgt in targets_fish:
+    res = run_pipeline_target(
+        fish_df,
+        features_fish,
+        tgt,
+        n_splits=10
+    )
+
+    results_fish.append(res)
+
+if len(results_fish) == 0:
+    raise ValueError("No results were generated.")
+
+
+# ============================================================
+# 15. CREATE HEADER
+# ============================================================
+
+combined_header_path = create_combined_header(
+    results=results_fish,
+    export_dir=EXPORT_DIR,
+    header_name=COMBINED_HEADER_NAME,
+    feature_min=feature_min,
+    feature_step=feature_step
+)
+
+print("\nCompact micro-ensemble + quantized header created:")
+print(combined_header_path)
+
+validate_header(combined_header_path)
+
+
+# ============================================================
+# 16. SAVE SUMMARY TABLE
+# ============================================================
+
+summary_rows = []
+
+for res in results_fish:
+    summary_rows.append({
+        "target": res["target"],
+        "n_samples": res["n_samples"],
+        "selected_model": res["best_model_name"],
+        "cv_mae": res["cv_best_mae"],
+        "cv_rmse": res["cv_best_rmse"],
+        "cv_r2": res["cv_best_r2"],
+        "loo_mae": res["loo_mae"],
+        "loo_rmse": res["loo_rmse"],
+        "loo_r2": res["loo_r2"],
+        "c_function": f"predict_{make_c_name(res['target'])}",
+    })
+
+summary_df = pd.DataFrame(summary_rows)
+
+summary_csv_path = os.path.join(EXPORT_DIR, "fish_micro_quantized_model_summary.csv")
+summary_df.to_csv(summary_csv_path, index=False)
+
+print("\nModel summary:")
+print(summary_df.to_string(index=False))
+
+print("\nSummary CSV saved to:")
+print(summary_csv_path)
+
+
+# ============================================================
+# 17. TEST PREDICTION FROM PYTHON FINAL MODELS
+# ============================================================
+
+test_df = fish_df[features_fish].dropna()
+
+if len(test_df) > 0:
+    test_input = test_df.iloc[0].values.astype(float)
+
+    print("\nTest input:")
+    for name, value in zip(features_fish, test_input):
+        print(f"  {name}: {value}")
+
+    test_rows = []
+
+    for res in results_fish:
+        pred = float(res["final_model"].predict(test_input.reshape(1, -1))[0])
+
+        if pred < 0:
+            pred = 0.0
+
+        test_rows.append({
+            "target": res["target"],
+            "selected_model": res["best_model_name"],
+            "c_function": f"predict_{make_c_name(res['target'])}",
+            "python_prediction": pred,
+        })
+
+    test_pred_df = pd.DataFrame(test_rows)
+
+    test_pred_path = os.path.join(EXPORT_DIR, "python_final_model_test_predictions.csv")
+    test_pred_df.to_csv(test_pred_path, index=False)
+
+    print("\nPython final-model predictions for one test input:")
+    print(test_pred_df.to_string(index=False))
+
+    print("\nTest prediction CSV saved to:")
+    print(test_pred_path)
+
+
+# ============================================================
+# 18. FINAL OUTPUT
+# ============================================================
+
+print("\nExport complete.")
+print("Generated folder:")
+print(EXPORT_DIR)
+
+print("\nUse this Arduino header:")
+print(combined_header_path)
+
+print("\nArduino include line:")
+print('#include "fish_compact_models.h"')
+
+print("\nArduino input must be:")
+print("float input_raw[4];")
+
+print("\nFeature order:")
+for i, feature in enumerate(features_fish):
+    print(f"  input_raw[{i}] = {feature}")
+
+print("\nArduino function names:")
+for res in results_fish:
+    print(f"  {res['target']} -> predict_{make_c_name(res['target'])}()")
