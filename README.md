@@ -29,12 +29,12 @@ original_uploaded_code/
 
 ## Firmware summary
 
-| Firmware folder | Node | TinyML | Turbidity | Main purpose |
+| Firmware folder | Node | TinyML  | Main purpose |
 |---|---|---:|---:|---|
-| `biofloc_node_with_TinyML` | Biofloc reactor | Yes | Yes | Sensor telemetry plus embedded soft-sensor prediction. |
-| `biofloc_node_without_TinyML` | Biofloc reactor | No | Yes | Sensor-only baseline with turbidity. |
-| `fish_node_with_TinyML` | Fish tank | Yes | No | Sensor telemetry plus embedded soft-sensor prediction. |
-| `fish_node_without_TinyML` | Fish tank | No | No | Sensor-only baseline. |
+| `biofloc_node_with_TinyML` | Biofloc reactor | Yes  | Sensor telemetry plus embedded soft-sensor prediction. |
+| `biofloc_node_without_TinyML` | Biofloc reactor | No | Sensor-only baseline with turbidity. |
+| `fish_node_with_TinyML` | Fish tank | Yes  | Sensor telemetry plus embedded soft-sensor prediction. |
+| `fish_node_without_TinyML` | Fish tank | No | Sensor-only baseline. |
 
 ## Embedded model input order
 
