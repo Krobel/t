@@ -8,7 +8,7 @@ import pandas as pd
 
 from common_model_pipeline import all_model_metric_table, result_summary_rows, run_target_pipeline
 
-FILE_PATH = "/content/drive/MyDrive/Colab Notebooks/split tank full data.xlsx"
+FILE_PATH = "/content/drive/MyDrive/Colab Notebooks/ data.xlsx"
 SHEET_NAME = "Fish tank"
 
 # Final deployed fish model uses four features.
@@ -17,7 +17,6 @@ FEATURES_FISH = [
     "DO_F(mg/L)",
     "ORP_F(mV)",
     "pH_F",
-    "Ec_F(mS/cm)"
     "Temp_F(C)",
 ]
 
