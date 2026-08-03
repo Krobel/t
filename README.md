@@ -32,7 +32,7 @@ original_uploaded_code/
 | Firmware folder | Node | TinyML  | Main purpose |
 |---|---|---:|---:|
 | `biofloc_node_with_TinyML` | Biofloc reactor | Yes  | Sensor telemetry plus embedded soft-sensor prediction. |
-| `biofloc_node_without_TinyML` | Biofloc reactor | No | Sensor-only baseline with turbidity. |
+| `biofloc_node_without_TinyML` | Biofloc reactor | No | Sensor-only baseline. |
 | `fish_node_with_TinyML` | Fish tank | Yes  | Sensor telemetry plus embedded soft-sensor prediction. |
 | `fish_node_without_TinyML` | Fish tank | No | Sensor-only baseline. |
 
